@@ -298,7 +298,7 @@ public:
         GC::Ref<Node> node;
     };
     // FIXME: It would be good if we could always provide this metadata for use in optimizations.
-    virtual void children_changed(ChildrenChangedMetadata const*) { }
+    virtual void children_changed(ChildrenChangedMetadata const&) { }
 
     virtual void adopted_from(Document&) { }
     virtual WebIDL::ExceptionOr<void> cloned(Node&, bool) const { return {}; }
@@ -454,6 +454,7 @@ public:
     bool is_inert() const;
 
     bool has_inclusive_ancestor_with_display_none();
+    bool has_inclusive_ancestor_with_event_listener(FlyString const& type) const;
 
     GC::Ptr<ShadowRoot> containing_shadow_root();
     GC::Ptr<ShadowRoot const> containing_shadow_root() const

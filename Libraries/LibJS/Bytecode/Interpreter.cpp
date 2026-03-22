@@ -9,11 +9,9 @@
 #include <AK/HashTable.h>
 #include <AK/TemporaryChange.h>
 #include <LibGC/RootHashMap.h>
-#include <LibJS/AST.h>
 #include <LibJS/Bytecode/AsmInterpreter/AsmInterpreter.h>
 #include <LibJS/Bytecode/BasicBlock.h>
 #include <LibJS/Bytecode/FormatOperand.h>
-#include <LibJS/Bytecode/Generator.h>
 #include <LibJS/Bytecode/Instruction.h>
 #include <LibJS/Bytecode/Interpreter.h>
 #include <LibJS/Bytecode/Label.h>
@@ -32,7 +30,6 @@
 #include <LibJS/Runtime/ECMAScriptFunctionObject.h>
 #include <LibJS/Runtime/Environment.h>
 #include <LibJS/Runtime/FunctionEnvironment.h>
-#include <LibJS/Runtime/GeneratorResult.h>
 #include <LibJS/Runtime/GlobalEnvironment.h>
 #include <LibJS/Runtime/GlobalObject.h>
 #include <LibJS/Runtime/Iterator.h>
@@ -95,10 +92,13 @@ Interpreter::~Interpreter() = default;
 
 ALWAYS_INLINE Value Interpreter::do_yield(Value value, Optional<Label> continuation)
 {
-    // FIXME: If we get a pointer, which is not accurately representable as a double
-    //        will cause this to explode
-    auto continuation_value = continuation.has_value() ? Value(continuation->address()) : js_null();
-    return vm().heap().allocate<GeneratorResult>(value, continuation_value, false).ptr();
+    auto& context = running_execution_context();
+    if (continuation.has_value())
+        context.yield_continuation = continuation->address();
+    else
+        context.yield_continuation = ExecutionContext::no_yield_continuation;
+    context.yield_is_await = false;
+    return value;
 }
 
 // 16.1.6 ScriptEvaluation ( scriptRecord ), https://tc39.es/ecma262/#sec-runtime-semantics-scriptevaluation
@@ -117,13 +117,6 @@ ThrowCompletionOr<Value> Interpreter::run(Script& script_record, GC::Ptr<Environ
 
     // 11. Let script be scriptRecord.[[ECMAScriptCode]].
     GC::Ptr<Executable> executable = script_record.cached_executable();
-    if (!executable && result.type() == Completion::Type::Normal) {
-        executable = JS::Bytecode::Generator::generate_from_ast_node(vm, *script_record.parse_node(), {});
-        if (executable) {
-            script_record.cache_executable(*executable);
-            script_record.drop_ast();
-        }
-    }
     if (executable && g_dump_bytecode)
         executable->dump();
 
@@ -170,7 +163,7 @@ ThrowCompletionOr<Value> Interpreter::run(Script& script_record, GC::Ptr<Environ
     // 13. If result.[[Type]] is normal, then
     if (executable && result.type() == Completion::Type::Normal) {
         // a. Set result to Completion(Evaluation of script).
-        result = run_executable(*script_context, *executable, {}, {});
+        result = run_executable(*script_context, *executable, 0, {});
 
         // b. If result is a normal completion and result.[[Value]] is empty, then
         if (result.type() == Completion::Type::Normal && result.value().is_special_empty_value()) {
@@ -271,7 +264,7 @@ ExecutionContext* Interpreter::push_inline_frame(
         return nullptr;
 
     // Copy arguments from caller's registers into callee's argument slots.
-    auto* callee_argument_values = callee_context->arguments.data();
+    auto* callee_argument_values = callee_context->arguments_data();
     for (u32 i = 0; i < insn_argument_count; ++i)
         callee_argument_values[i] = get(arguments[i]);
     for (size_t i = insn_argument_count; i < argument_count; ++i)
@@ -280,7 +273,6 @@ ExecutionContext* Interpreter::push_inline_frame(
 
     // Set up caller linkage so Return can restore the caller frame.
     callee_context->caller_frame = m_running_execution_context;
-    callee_context->caller_executable = m_running_execution_context->executable;
     callee_context->caller_dst_raw = dst_raw;
     callee_context->caller_return_pc = return_pc;
     callee_context->caller_is_construct = is_construct;
@@ -316,11 +308,6 @@ ExecutionContext* Interpreter::push_inline_frame(
     //     and global_declarative_environment, since the caller's realm may differ
     //     in cross-realm calls (e.g. iframe <-> parent).
     callee_context->executable = callee_executable;
-    auto& callee_realm = *callee_context->realm;
-    callee_context->global_object = callee_realm.global_object();
-    callee_context->global_declarative_environment = callee_realm.global_environment().declarative_record();
-    callee_context->identifier_table = callee_executable.identifier_table->identifiers().data();
-    callee_context->property_key_table = callee_executable.property_key_table->property_keys().data();
 
     // Copy constants (memcpy avoids aliasing issues with the scalar loop).
     auto* values = callee_context->registers_and_constants_and_locals_and_arguments();
@@ -496,6 +483,21 @@ void Interpreter::run_bytecode(size_t entry_point)
             auto& instruction = *reinterpret_cast<Op::Mov const*>(&bytecode[program_counter]);
             set(instruction.dst(), get(instruction.src()));
             DISPATCH_NEXT(Mov);
+        }
+
+        handle_Mov2: {
+            auto& instruction = *reinterpret_cast<Op::Mov2 const*>(&bytecode[program_counter]);
+            set(instruction.dst1(), get(instruction.src1()));
+            set(instruction.dst2(), get(instruction.src2()));
+            DISPATCH_NEXT(Mov2);
+        }
+
+        handle_Mov3: {
+            auto& instruction = *reinterpret_cast<Op::Mov3 const*>(&bytecode[program_counter]);
+            set(instruction.dst1(), get(instruction.src1()));
+            set(instruction.dst2(), get(instruction.src2()));
+            set(instruction.dst3(), get(instruction.src3()));
+            DISPATCH_NEXT(Mov3);
         }
 
         handle_End: {
@@ -808,15 +810,20 @@ void Interpreter::run_bytecode(size_t entry_point)
 
 Utf16FlyString const& Interpreter::get_identifier(IdentifierTableIndex index) const
 {
-    return m_running_execution_context->identifier_table[index.value];
+    return m_running_execution_context->executable->get_identifier(index);
 }
 
 PropertyKey const& Interpreter::get_property_key(PropertyKeyTableIndex index) const
 {
-    return m_running_execution_context->property_key_table[index.value];
+    return m_running_execution_context->executable->get_property_key(index);
 }
 
-ThrowCompletionOr<Value> Interpreter::run_executable(ExecutionContext& context, Executable& executable, Optional<size_t> entry_point)
+DeclarativeEnvironment& Interpreter::global_declarative_environment()
+{
+    return realm().global_declarative_environment();
+}
+
+ThrowCompletionOr<Value> Interpreter::run_executable(ExecutionContext& context, Executable& executable, u32 entry_point)
 {
     dbgln_if(JS_BYTECODE_DEBUG, "Bytecode::Interpreter will run unit {}", &executable);
 
@@ -824,10 +831,6 @@ ThrowCompletionOr<Value> Interpreter::run_executable(ExecutionContext& context, 
     TemporaryChange restore_running_execution_context { m_running_execution_context, &context };
 
     context.executable = executable;
-    context.global_object = realm().global_object();
-    context.global_declarative_environment = realm().global_environment().declarative_record();
-    context.identifier_table = executable.identifier_table->identifiers().data();
-    context.property_key_table = executable.property_key_table->property_keys().data();
 
     VERIFY(executable.registers_and_locals_count + executable.constants.size() == executable.registers_and_locals_and_constants_count);
     VERIFY(executable.registers_and_locals_and_constants_count <= context.registers_and_constants_and_locals_and_arguments_span().size());
@@ -846,7 +849,7 @@ ThrowCompletionOr<Value> Interpreter::run_executable(ExecutionContext& context, 
             executable.constants.data(),
             count * sizeof(Value));
 
-    run_bytecode(entry_point.value_or(0));
+    run_bytecode(entry_point);
 
     dbgln_if(JS_BYTECODE_DEBUG, "Bytecode::Interpreter did run unit {}", context.executable);
 
@@ -875,30 +878,6 @@ void Interpreter::catch_exception(Operand dst)
 {
     set(dst, reg(Register::exception()));
     reg(Register::exception()) = js_special_empty_value();
-}
-
-GC::Ref<Bytecode::Executable> compile(VM& vm, ASTNode const& node, FunctionKind kind, Utf16FlyString const& name)
-{
-    auto bytecode_executable = Bytecode::Generator::generate_from_ast_node(vm, node, kind);
-    bytecode_executable->name = name;
-
-    if (Bytecode::g_dump_bytecode)
-        bytecode_executable->dump();
-
-    return bytecode_executable;
-}
-
-GC::Ref<Bytecode::Executable> compile(VM& vm, GC::Ref<SharedFunctionInstanceData const> shared_function_instance_data, BuiltinAbstractOperationsEnabled builtin_abstract_operations_enabled)
-{
-    auto const& name = shared_function_instance_data->m_name;
-
-    auto bytecode_executable = Bytecode::Generator::generate_from_function(vm, shared_function_instance_data, builtin_abstract_operations_enabled);
-    bytecode_executable->name = name;
-
-    if (Bytecode::g_dump_bytecode)
-        bytecode_executable->dump();
-
-    return bytecode_executable;
 }
 
 // NOTE: This function assumes that the index is valid within the TypedArray,
@@ -980,17 +959,10 @@ inline ThrowCompletionOr<Value> get_by_value(VM& vm, Optional<IdentifierTableInd
         auto& object = base_value.as_object();
         auto index = static_cast<u32>(property_key_value.as_i32());
 
-        auto const* object_storage = object.indexed_properties().storage();
-
         // For "non-typed arrays":
         if (!object.may_interfere_with_indexed_property_access()
-            && object_storage) {
-            auto maybe_value = [&] {
-                if (object_storage->is_simple_storage())
-                    return static_cast<SimpleIndexedPropertyStorage const*>(object_storage)->inline_get(index);
-                else
-                    return static_cast<GenericIndexedPropertyStorage const*>(object_storage)->get(index);
-            }();
+            && object.indexed_storage_kind() != IndexedStorageKind::None) {
+            auto maybe_value = object.indexed_get(index);
             if (maybe_value.has_value()) {
                 auto value = maybe_value->value;
                 if (!value.is_accessor())
@@ -1176,7 +1148,7 @@ inline Value new_function(Interpreter& interpreter, u32 shared_function_data_ind
 
     if (home_object.has_value()) {
         auto home_object_value = interpreter.get(home_object.value());
-        function->set_home_object(&home_object_value.as_object());
+        function->make_method(home_object_value.as_object());
     }
 
     return function;
@@ -1188,18 +1160,17 @@ inline ThrowCompletionOr<void> put_by_value(VM& vm, Value base, Optional<Utf16Fl
     if (kind == PutKind::Normal
         && base.is_object() && property_key_value.is_non_negative_int32()) {
         auto& object = base.as_object();
-        auto* storage = object.indexed_properties().storage();
         auto index = static_cast<u32>(property_key_value.as_i32());
 
         // For "non-typed arrays":
-        if (storage
-            && storage->is_simple_storage()
-            && !object.may_interfere_with_indexed_property_access()) {
-            auto maybe_value = storage->get(index);
+        if (!object.may_interfere_with_indexed_property_access()
+            && object.indexed_storage_kind() != IndexedStorageKind::None
+            && object.indexed_storage_kind() != IndexedStorageKind::Dictionary) {
+            auto maybe_value = object.indexed_get(index);
             if (maybe_value.has_value()) {
                 auto existing_value = maybe_value->value;
                 if (!existing_value.is_accessor()) {
-                    storage->put(index, value);
+                    object.indexed_put(index, value);
                     return {};
                 }
             }
@@ -1453,18 +1424,18 @@ inline ThrowCompletionOr<void> append(VM& vm, Value lhs, Value rhs, bool is_spre
 
     // Note: We know from codegen, that lhs is a plain array with only indexed properties
     auto& lhs_array = lhs.as_array();
-    auto lhs_size = lhs_array.indexed_properties().array_like_size();
+    auto lhs_size = lhs_array.indexed_array_like_size();
 
     if (is_spread) {
         // ...rhs
         size_t i = lhs_size;
         TRY(get_iterator_values(vm, rhs, [&i, &lhs_array](Value iterator_value) -> Optional<Completion> {
-            lhs_array.indexed_properties().put(i, iterator_value, default_attributes);
+            lhs_array.indexed_put(i, iterator_value);
             ++i;
             return {};
         }));
     } else {
-        lhs_array.indexed_properties().put(lhs_size, rhs, default_attributes);
+        lhs_array.indexed_put(lhs_size, rhs);
     }
 
     return {};
@@ -1960,7 +1931,7 @@ void NewArray::execute_impl(Bytecode::Interpreter& interpreter) const
 {
     auto array = MUST(Array::create(interpreter.realm(), m_element_count));
     for (size_t i = 0; i < m_element_count; i++) {
-        array->indexed_properties().put(i, interpreter.get(m_elements[i]), default_attributes);
+        array->indexed_put(i, interpreter.get(m_elements[i]));
     }
     interpreter.set(dst(), array);
 }
@@ -1969,7 +1940,7 @@ void NewPrimitiveArray::execute_impl(Bytecode::Interpreter& interpreter) const
 {
     auto array = MUST(Array::create(interpreter.realm(), m_element_count));
     for (size_t i = 0; i < m_element_count; i++)
-        array->indexed_properties().put(i, m_elements[i], default_attributes);
+        array->indexed_put(i, m_elements[i]);
     interpreter.set(dst(), array);
 }
 
@@ -2015,13 +1986,13 @@ void GetTemplateObject::execute_impl(Bytecode::Interpreter& interpreter) const
         auto cooked_value = interpreter.get(m_strings[index]);
 
         // c. Perform ! DefinePropertyOrThrow(template, prop, PropertyDescriptor { [[Value]]: cookedValue, [[Writable]]: false, [[Enumerable]]: true, [[Configurable]]: false }).
-        template_object->indexed_properties().put(index, cooked_value, Attribute::Enumerable);
+        template_object->indexed_put(index, cooked_value, Attribute::Enumerable);
 
         // d. Let rawValue be the String value rawStrings[index].
         auto raw_value = interpreter.get(m_strings[count + index]);
 
         // e. Perform ! DefinePropertyOrThrow(rawObj, prop, PropertyDescriptor { [[Value]]: rawValue, [[Writable]]: false, [[Enumerable]]: true, [[Configurable]]: false }).
-        raw_object->indexed_properties().put(index, raw_value, Attribute::Enumerable);
+        raw_object->indexed_put(index, raw_value, Attribute::Enumerable);
 
         // f. Set index to index + 1.
     }
@@ -2434,18 +2405,18 @@ ThrowCompletionOr<void> CreateVariable::execute_impl(Bytecode::Interpreter& inte
 
 void CreateRestParams::execute_impl(Bytecode::Interpreter& interpreter) const
 {
-    auto const arguments = interpreter.running_execution_context().arguments;
+    auto const arguments = interpreter.running_execution_context().arguments_span();
     auto arguments_count = interpreter.running_execution_context().passed_argument_count;
     auto array = MUST(Array::create(interpreter.realm(), 0));
     for (size_t rest_index = m_rest_index; rest_index < arguments_count; ++rest_index)
-        array->indexed_properties().append(arguments[rest_index]);
+        array->indexed_append(arguments[rest_index]);
     interpreter.set(m_dst, array);
 }
 
 void CreateArguments::execute_impl(Bytecode::Interpreter& interpreter) const
 {
     auto const& function = interpreter.running_execution_context().function;
-    auto const arguments = interpreter.running_execution_context().arguments;
+    auto const arguments = interpreter.running_execution_context().arguments_span();
     auto const& environment = interpreter.running_execution_context().lexical_environment;
 
     auto passed_arguments = ReadonlySpan<Value> { arguments.data(), interpreter.running_execution_context().passed_argument_count };
@@ -2773,8 +2744,8 @@ NEVER_INLINE static ThrowCompletionOr<void> execute_call(
         return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
     ScopeGuard deallocate_guard = [&stack, stack_mark] { stack.deallocate(stack_mark); };
 
-    auto* callee_context_argument_values = callee_context->arguments.data();
-    auto const callee_context_argument_count = callee_context->arguments.size();
+    auto* callee_context_argument_values = callee_context->arguments_data();
+    auto const callee_context_argument_count = callee_context->argument_count;
     auto const insn_argument_count = arguments.size();
 
     for (size_t i = 0; i < insn_argument_count; ++i)
@@ -2785,7 +2756,7 @@ NEVER_INLINE static ThrowCompletionOr<void> execute_call(
 
     Value retval;
     if (call_type == CallType::DirectEval && callee == interpreter.realm().intrinsics().eval_function()) {
-        retval = TRY(perform_eval(vm, !callee_context->arguments.is_empty() ? callee_context->arguments[0] : js_undefined(), strict == Strict::Yes ? CallerMode::Strict : CallerMode::NonStrict, EvalMode::Direct));
+        retval = TRY(perform_eval(vm, callee_context->argument_count > 0 ? callee_context->arguments_data()[0] : js_undefined(), strict == Strict::Yes ? CallerMode::Strict : CallerMode::NonStrict, EvalMode::Direct));
     } else if (call_type == CallType::Construct) {
         retval = TRY(function.internal_construct(*callee_context, function));
     } else {
@@ -2838,7 +2809,7 @@ NEVER_INLINE static ThrowCompletionOr<void> call_with_argument_array(
     auto& function = callee.as_function();
 
     auto& argument_array = arguments.as_array();
-    auto argument_array_length = argument_array.indexed_properties().array_like_size();
+    auto argument_array_length = argument_array.indexed_array_like_size();
 
     size_t argument_count = argument_array_length;
     size_t registers_and_locals_count = 0;
@@ -2852,12 +2823,12 @@ NEVER_INLINE static ThrowCompletionOr<void> call_with_argument_array(
         return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
     ScopeGuard deallocate_guard = [&stack, stack_mark] { stack.deallocate(stack_mark); };
 
-    auto* callee_context_argument_values = callee_context->arguments.data();
-    auto const callee_context_argument_count = callee_context->arguments.size();
+    auto* callee_context_argument_values = callee_context->arguments_data();
+    auto const callee_context_argument_count = callee_context->argument_count;
     auto const insn_argument_count = argument_array_length;
 
     for (size_t i = 0; i < insn_argument_count; ++i) {
-        if (auto maybe_value = argument_array.indexed_properties().get(i); maybe_value.has_value())
+        if (auto maybe_value = argument_array.indexed_get(i); maybe_value.has_value())
             callee_context_argument_values[i] = maybe_value.release_value().value;
         else
             callee_context_argument_values[i] = js_undefined();
@@ -2868,7 +2839,7 @@ NEVER_INLINE static ThrowCompletionOr<void> call_with_argument_array(
 
     Value retval;
     if (call_type == CallType::DirectEval && callee == interpreter.realm().intrinsics().eval_function()) {
-        retval = TRY(perform_eval(vm, !callee_context->arguments.is_empty() ? callee_context->arguments[0] : js_undefined(), strict == Strict::Yes ? CallerMode::Strict : CallerMode::NonStrict, EvalMode::Direct));
+        retval = TRY(perform_eval(vm, callee_context->argument_count > 0 ? callee_context->arguments_data()[0] : js_undefined(), strict == Strict::Yes ? CallerMode::Strict : CallerMode::NonStrict, EvalMode::Direct));
     } else if (call_type == CallType::Construct) {
         retval = TRY(function.internal_construct(*callee_context, function));
     } else {
@@ -2922,7 +2893,7 @@ ThrowCompletionOr<void> SuperCallWithArgumentArray::execute_impl(Bytecode::Inter
     if (m_is_synthetic) {
         argument_array_length = MUST(length_of_array_like(vm, argument_array));
     } else {
-        argument_array_length = argument_array.indexed_properties().array_like_size();
+        argument_array_length = argument_array.indexed_array_like_size();
     }
 
     size_t argument_count = argument_array_length;
@@ -2937,8 +2908,8 @@ ThrowCompletionOr<void> SuperCallWithArgumentArray::execute_impl(Bytecode::Inter
         return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
     ScopeGuard deallocate_guard = [&stack, stack_mark] { stack.deallocate(stack_mark); };
 
-    auto* callee_context_argument_values = callee_context->arguments.data();
-    auto const callee_context_argument_count = callee_context->arguments.size();
+    auto* callee_context_argument_values = callee_context->arguments_data();
+    auto const callee_context_argument_count = callee_context->argument_count;
     auto const insn_argument_count = argument_array_length;
 
     if (m_is_synthetic) {
@@ -2946,7 +2917,7 @@ ThrowCompletionOr<void> SuperCallWithArgumentArray::execute_impl(Bytecode::Inter
             callee_context_argument_values[i] = argument_array.get_without_side_effects(PropertyKey { i });
     } else {
         for (size_t i = 0; i < insn_argument_count; ++i) {
-            if (auto maybe_value = argument_array.indexed_properties().get(i); maybe_value.has_value())
+            if (auto maybe_value = argument_array.indexed_get(i); maybe_value.has_value())
                 callee_context_argument_values[i] = maybe_value.release_value().value;
             else
                 callee_context_argument_values[i] = js_undefined();
@@ -3120,11 +3091,10 @@ void Yield::execute_impl(Bytecode::Interpreter& interpreter) const
 void Await::execute_impl(Bytecode::Interpreter& interpreter) const
 {
     auto yielded_value = interpreter.get(m_argument).is_special_empty_value() ? js_undefined() : interpreter.get(m_argument);
-    // FIXME: If we get a pointer, which is not accurately representable as a double
-    //        will cause this to explode
-    auto continuation_value = Value(m_continuation_label.address());
-    auto result = interpreter.vm().heap().allocate<GeneratorResult>(yielded_value, continuation_value, true);
-    interpreter.do_return(result);
+    auto& context = interpreter.running_execution_context();
+    context.yield_continuation = m_continuation_label.address();
+    context.yield_is_await = true;
+    interpreter.do_return(yielded_value);
 }
 
 ThrowCompletionOr<void> GetByValue::execute_impl(Bytecode::Interpreter& interpreter) const

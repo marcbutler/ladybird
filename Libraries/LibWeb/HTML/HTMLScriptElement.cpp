@@ -204,10 +204,8 @@ void HTMLScriptElement::execute_script()
 void HTMLScriptElement::prepare_script()
 {
     // 1. If el's already started is true, then return.
-    if (m_already_started) {
-        dbgln("HTMLScriptElement: Refusing to run script because it has already started.");
+    if (m_already_started)
         return;
-    }
 
     // 2. Let parser document be el's parser document.
     GC::Ptr<DOM::Document> parser_document = m_parser_document;
@@ -234,10 +232,8 @@ void HTMLScriptElement::prepare_script()
     }
 
     // 8. If el is not connected, then return.
-    if (!is_connected()) {
-        dbgln("HTMLScriptElement: Refusing to run script because the element is not connected.");
+    if (!is_connected())
         return;
-    }
 
     // 9. If any of the following are true:
     //    - el has a type attribute whose value is the empty string;
@@ -648,9 +644,15 @@ void HTMLScriptElement::prepare_script()
 }
 
 // https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:children-changed-steps
-void HTMLScriptElement::children_changed(ChildrenChangedMetadata const* metadata)
+void HTMLScriptElement::children_changed(ChildrenChangedMetadata const& metadata)
 {
     Base::children_changed(metadata);
+
+    // AD-HOC: Avoid running script on child removal, matching the behaviour of other browsers.
+    //         We also do not run script on child mutation, matching the behaviour of chromium and webkit.
+    //         See: https://github.com/whatwg/html/issues/12279
+    if (metadata.type != ChildrenChangedMetadata::Type::Inserted)
+        return;
 
     // 1. If the script element is not connected, then return.
     if (!is_connected())

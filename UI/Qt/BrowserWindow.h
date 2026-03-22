@@ -11,14 +11,12 @@
 #include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWebView/Forward.h>
 #include <UI/Qt/Tab.h>
+#include <UI/Qt/TabBar.h>
 
 #include <QIcon>
 #include <QMainWindow>
-#include <QMenuBar>
 #include <QPushButton>
 #include <QTabBar>
-#include <QTabWidget>
-#include <QToolBar>
 
 class QPropertyAnimation;
 
@@ -49,7 +47,12 @@ public:
     static constexpr int button_animation_time() { return 750; }
     explicit FullscreenMode(BrowserWindow* window, ExitFullscreenButton* exit_button);
 
-    void exit();
+    enum class ExitInitiatedBy {
+        UI,
+        WebContent,
+    };
+
+    void exit(ExitInitiatedBy);
     void enter(Tab* tab);
     // Called after a window change event that has identifed the current window state to be fullscreen.
     void entered_fullscreen();
@@ -124,9 +127,6 @@ public slots:
     void enter_fullscreen();
     void exit_fullscreen();
 
-protected:
-    bool eventFilter(QObject* obj, QEvent* event) override;
-
 private:
     virtual bool event(QEvent*) override;
     virtual void resizeEvent(QResizeEvent*) override;
@@ -143,10 +143,8 @@ private:
     template<typename Callback>
     void for_each_tab(Callback&& callback)
     {
-        for (int i = 0; i < m_tabs_container->count(); ++i) {
-            auto& tab = as<Tab>(*m_tabs_container->widget(i));
-            callback(tab);
-        }
+        for (int i = 0; i < m_tabs_container->count(); ++i)
+            callback(*m_tabs_container->tab(i));
     }
 
     void create_close_button_for_tab(Tab*);
@@ -161,10 +159,8 @@ private:
     double m_device_pixel_ratio { 0 };
     double m_refresh_rate { 60.0 };
 
-    QTabWidget* m_tabs_container { nullptr };
+    TabWidget* m_tabs_container { nullptr };
     Tab* m_current_tab { nullptr };
-
-    QToolBar* m_new_tab_button_toolbar { nullptr };
 
     QMenu* m_hamburger_menu { nullptr };
 

@@ -42,8 +42,6 @@ void Environment::visit_edges(Cell::Visitor& visitor)
 EnvironmentSettingsObject::EnvironmentSettingsObject(NonnullOwnPtr<JS::ExecutionContext> realm_execution_context)
     : m_realm_execution_context(move(realm_execution_context))
 {
-    m_realm_execution_context->context_owner = this;
-
     // Register with the responsible event loop so we can perform step 4 of "perform a microtask checkpoint".
     responsible_event_loop().register_environment_settings_object({}, *this);
 }
@@ -128,13 +126,10 @@ EventLoop& EnvironmentSettingsObject::responsible_event_loop()
 // https://whatpr.org/html/9893/webappapis.html#check-if-we-can-run-script
 RunScriptDecision can_run_script(JS::Realm const& realm)
 {
-    // 1. If the global object specified by realm is a Window object whose Document object is not fully active, then return "do not run".
-    if (auto const* window = as_if<HTML::Window>(realm.global_object())) {
-        auto const& document = window->associated_document();
-        // AD-HOC: We allow tasks for destroyed documents to run so that microtasks queued during the fetch of a new
-        //         document in a navigation can still be processed, even after the previous document, the one that
-        //         initiated the fetch, has been destroyed.
-        if (!document.has_been_destroyed() && !document.is_fully_active())
+    // 1. If the global object specified by realm is a Window object whose Document object is not fully active, then
+    //    return "do not run".
+    if (auto const* window = as_if<Window>(realm.global_object())) {
+        if (!window->associated_document().is_fully_active())
             return RunScriptDecision::DoNotRun;
     }
 

@@ -9,7 +9,6 @@
  */
 
 #include <LibGC/DeferGC.h>
-#include <LibJS/AST.h>
 #include <LibJS/Module.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/Environment.h>
@@ -331,6 +330,10 @@ void initialize_main_thread_vm(AgentType type)
             if (result.is_error())
                 HTML::report_exception(result, *realm);
         }));
+    };
+
+    s_main_thread_vm->host_promise_job_queue_is_empty = []() -> bool {
+        return HTML::main_thread_event_loop().microtask_queue_empty();
     };
 
     // 8.1.5.4.4 HostMakeJobCallback(callable), https://html.spec.whatwg.org/multipage/webappapis.html#hostmakejobcallback

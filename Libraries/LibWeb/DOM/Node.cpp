@@ -60,6 +60,7 @@
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/XMLSerializer.h>
 #include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Layout/Node.h>
@@ -816,7 +817,7 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
 
     // 9. Run the children changed steps for parent.
     ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Inserted, node };
-    children_changed(&metadata);
+    children_changed(metadata);
 
     // 10. Let staticNodeList be a list of nodes, initially « ».
     // NOTE: We collect all nodes before calling the post-connection steps on any one of them, instead of calling the
@@ -1083,7 +1084,8 @@ void Node::remove(bool suppress_observers)
     }
 
     // 17. Run the children changed steps for parent.
-    parent->children_changed(nullptr);
+    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Removal, *this };
+    parent->children_changed(metadata);
 
     document().bump_dom_tree_version();
 }
@@ -1680,7 +1682,8 @@ bool Node::is_editing_host() const
     }
 
     // or a child HTML element of a Document whose design mode enabled is true.
-    return is<Document>(parent()) && as<Document>(*parent()).design_mode_enabled_state();
+    auto* doc = as_if<Document>(parent());
+    return doc && doc->design_mode_enabled_state();
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#editing-host-of
@@ -2693,8 +2696,10 @@ void Node::clear_paintable()
 
 void Node::set_needs_repaint(InvalidateDisplayList should_invalidate_display_list)
 {
-    if (auto* p = unsafe_paintable())
-        p->set_needs_repaint(should_invalidate_display_list);
+    if (auto* layout_node = unsafe_layout_node()) {
+        for (auto& paintable : layout_node->paintables())
+            paintable.set_needs_repaint(should_invalidate_display_list);
+    }
 }
 
 void Node::set_needs_layout_update(SetNeedsLayoutReason reason)
@@ -3400,6 +3405,17 @@ bool Node::has_inclusive_ancestor_with_display_none()
             return true;
         }
     }
+    return false;
+}
+
+bool Node::has_inclusive_ancestor_with_event_listener(FlyString const& type) const
+{
+    for (auto const* ancestor = this; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+        if (ancestor->has_event_listener(type))
+            return true;
+    }
+    if (auto window = document().window())
+        return window->has_event_listener(type);
     return false;
 }
 

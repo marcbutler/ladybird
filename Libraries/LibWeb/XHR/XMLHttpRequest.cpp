@@ -203,14 +203,7 @@ WebIDL::ExceptionOr<JS::Value> XMLHttpRequest::response()
     // 5. If this’s response type is "arraybuffer",
     if (m_response_type == Bindings::XMLHttpRequestResponseType::Arraybuffer) {
         // then set this’s response object to a new ArrayBuffer object representing this’s received bytes. If this throws an exception, then set this’s response object to failure and return null.
-        auto buffer_result = JS::ArrayBuffer::create(realm(), m_received_bytes.size());
-        if (buffer_result.is_error()) {
-            m_response_object = Failure();
-            return JS::js_null();
-        }
-
-        auto buffer = buffer_result.release_value();
-        buffer->buffer().overwrite(0, m_received_bytes.data(), m_received_bytes.size());
+        auto buffer = JS::ArrayBuffer::create(realm(), move(m_received_bytes));
         m_response_object = GC::Ref<JS::Object> { buffer };
     }
     // 6. Otherwise, if this’s response type is "blob", set this’s response object to a new Blob object representing this’s received bytes with type set to the result of get a final MIME type for this.
@@ -509,16 +502,18 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::open(String const& method, String cons
     // 11. Set variables associated with the object as follows:
     // Unset this’s send() flag.
     m_send = false;
-    // Unset this’s upload listener flag.
-    m_upload_listener = false;
     // Set this’s request method to method.
     m_request_method = move(normalized_method);
     // Set this’s request URL to parsedURL.
     m_request_url = parsed_url.release_value();
-    // Set this’s synchronous flag if async is false; otherwise unset this’s synchronous flag.
-    m_synchronous = !async;
     // Empty this’s author request headers.
     m_author_request_headers->clear();
+    // Set this’s request body to null.
+    m_request_body = nullptr;
+    // Set this’s synchronous flag if async is false; otherwise unset this’s synchronous flag.
+    m_synchronous = !async;
+    // Unset this’s upload listener flag.
+    m_upload_listener = false;
     // Set this’s response to a network error.
     m_response = Fetch::Infrastructure::Response::network_error(realm().vm(), "Not yet sent"_string);
     // Set this’s received bytes to the empty byte sequence.
@@ -526,10 +521,6 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::open(String const& method, String cons
     // Set this’s response object to null.
     m_response_object = {};
     // Spec Note: Override MIME type is not overridden here as the overrideMimeType() method can be invoked before the open() method.
-
-    // AD-HOC: Reset the request body so a previous body doesn't leak into this request.
-    // https://github.com/whatwg/xhr/pull/404
-    m_request_body = nullptr;
 
     // 12. If this’s state is not opened, then:
     if (m_state != State::Opened) {
@@ -809,6 +800,10 @@ WebIDL::ExceptionOr<void> XMLHttpRequest::send(Optional<DocumentOrXMLHttpRequest
             // 9. If length is not an integer, then set it to 0.
             if (!length.has<u64>())
                 length = 0;
+
+            // Pre-allocate received bytes buffer if Content-Length is known.
+            if (length.get<u64>() > 0)
+                m_received_bytes.ensure_capacity(length.get<u64>());
 
             // 10. Let processBodyChunk given bytes be these steps:
             auto process_body_chunks = GC::create_function(heap(), [this, length](ByteBuffer byte_buffer) {

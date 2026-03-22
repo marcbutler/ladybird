@@ -176,7 +176,7 @@ public:
 
     size_t argument_count() const
     {
-        return running_execution_context().arguments.size();
+        return running_execution_context().argument_count;
     }
 
     Value argument(size_t index) const
@@ -299,8 +299,9 @@ public:
     Function<void(StringView)> host_unrecognized_date_string;
     Function<ThrowCompletionOr<void>(Realm&, NonnullOwnPtr<ExecutionContext>, ShadowRealm&)> host_initialize_shadow_realm;
     Function<Crypto::SignedBigInteger(Object const& global)> host_system_utc_epoch_nanoseconds;
+    Function<bool()> host_promise_job_queue_is_empty;
 
-    [[nodiscard]] GC::ConservativeVector<StackTraceElement> stack_trace() const;
+    [[nodiscard]] Vector<StackTraceElement> stack_trace() const;
 
 private:
     using ErrorMessages = AK::Array<Utf16String, to_underlying(ErrorMessage::__Count)>;

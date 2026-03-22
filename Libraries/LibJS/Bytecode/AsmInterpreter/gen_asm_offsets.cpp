@@ -11,12 +11,14 @@
 #include <LibJS/Bytecode/Builtins.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Bytecode/Interpreter.h>
+#include <LibJS/Bytecode/PutKind.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/DeclarativeEnvironment.h>
 #include <LibJS/Runtime/ExecutionContext.h>
 #include <LibJS/Runtime/FunctionObject.h>
 #include <LibJS/Runtime/IndexedProperties.h>
 #include <LibJS/Runtime/Object.h>
+#include <LibJS/Runtime/Realm.h>
 #include <LibJS/Runtime/Shape.h>
 #include <LibJS/Runtime/TypedArray.h>
 
@@ -36,8 +38,10 @@ int main()
     // Object layout
     outln("# Object layout");
     EMIT_OFFSET(OBJECT_SHAPE, Object, m_shape);
-    EMIT_OFFSET(OBJECT_STORAGE, Object, m_storage);
-    EMIT_OFFSET(OBJECT_INDEXED_PROPERTIES, Object, m_indexed_properties);
+    EMIT_OFFSET(OBJECT_NAMED_PROPERTIES, Object, m_named_properties);
+    EMIT_OFFSET(OBJECT_INDEXED_ELEMENTS, Object, m_indexed_elements);
+    EMIT_OFFSET(OBJECT_INDEXED_STORAGE_KIND, Object, m_indexed_storage_kind);
+    EMIT_OFFSET(OBJECT_INDEXED_ARRAY_LIKE_SIZE, Object, m_indexed_array_like_size);
     EMIT_SIZEOF(OBJECT_SIZE, Object);
 
     // Object flags byte
@@ -85,27 +89,29 @@ int main()
     // ExecutionContext layout
     outln("\n# ExecutionContext layout");
     EMIT_OFFSET(EXECUTION_CONTEXT_EXECUTABLE, ExecutionContext, executable);
-    EMIT_OFFSET(EXECUTION_CONTEXT_GLOBAL_OBJECT, ExecutionContext, global_object);
-    EMIT_OFFSET(EXECUTION_CONTEXT_GLOBAL_DECLARATIVE_ENVIRONMENT, ExecutionContext, global_declarative_environment);
+    EMIT_OFFSET(EXECUTION_CONTEXT_REALM, ExecutionContext, realm);
     EMIT_OFFSET(EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT, ExecutionContext, lexical_environment);
     EMIT_OFFSET(EXECUTION_CONTEXT_CALLER_FRAME, ExecutionContext, caller_frame);
     EMIT_OFFSET(EXECUTION_CONTEXT_PROGRAM_COUNTER, ExecutionContext, program_counter);
     EMIT_SIZEOF(SIZEOF_EXECUTION_CONTEXT, ExecutionContext);
 
+    // Realm layout
+    outln("\n# Realm layout");
+    EMIT_OFFSET(REALM_GLOBAL_OBJECT, Realm, m_global_object);
+    EMIT_OFFSET(REALM_GLOBAL_DECLARATIVE_ENVIRONMENT, Realm, m_global_declarative_environment);
+
     // Interpreter layout
     outln("\n# Interpreter layout");
     EMIT_OFFSET(INTERPRETER_RUNNING_EXECUTION_CONTEXT, Interpreter, m_running_execution_context);
 
-    // IndexedPropertyStorage layout
-    outln("\n# IndexedPropertyStorage layout");
-    EMIT_OFFSET(INDEXED_PROPERTY_STORAGE_ARRAY_SIZE, IndexedPropertyStorage, m_array_size);
-    EMIT_OFFSET(INDEXED_PROPERTY_STORAGE_IS_SIMPLE, IndexedPropertyStorage, m_is_simple_storage);
+    // IndexedStorageKind enum values
+    outln("\n# IndexedStorageKind enum values");
+    outln("const INDEXED_STORAGE_KIND_NONE = {}", static_cast<u8>(IndexedStorageKind::None));
+    outln("const INDEXED_STORAGE_KIND_PACKED = {}", static_cast<u8>(IndexedStorageKind::Packed));
+    outln("const INDEXED_STORAGE_KIND_HOLEY = {}", static_cast<u8>(IndexedStorageKind::Holey));
+    outln("const INDEXED_STORAGE_KIND_DICTIONARY = {}", static_cast<u8>(IndexedStorageKind::Dictionary));
 
-    // SimpleIndexedPropertyStorage layout
-    outln("\n# SimpleIndexedPropertyStorage layout");
-    EMIT_OFFSET(SIMPLE_INDEXED_PROPERTY_STORAGE_PACKED_ELEMENTS, SimpleIndexedPropertyStorage, m_packed_elements);
-
-    // Vector<Value> layout (used for m_packed_elements and m_storage)
+    // Vector<Value> layout (used for bytecode)
     outln("\n# Vector<Value> layout");
     {
         Vector<Value> v;
@@ -115,14 +121,13 @@ int main()
         outln("const VECTOR_DATA = {}", vec_data);
         outln("const VECTOR_SIZE = {}", vec_size);
 
-        // Composite offsets for Object.m_storage data pointer
-        outln("const OBJECT_STORAGE_DATA = {}", offsetof(Object, m_storage) + vec_data);
-        outln("const OBJECT_STORAGE_SIZE = {}", offsetof(Object, m_storage) + vec_size);
-        // Composite offsets for SimpleIndexedPropertyStorage.m_packed_elements data pointer
-        outln("const SIMPLE_INDEXED_PROPERTY_STORAGE_PACKED_DATA = {}", offsetof(SimpleIndexedPropertyStorage, m_packed_elements) + vec_data);
         // Composite offset for Executable.bytecode data pointer
         outln("const EXECUTABLE_BYTECODE_DATA = {}", offsetof(Executable, bytecode) + vec_data);
     }
+
+    // PutKind enum
+    outln("\n# PutKind enum");
+    outln("const PUT_KIND_NORMAL = {}", static_cast<u8>(JS::Bytecode::PutKind::Normal));
 
     // PrototypeChainValidity layout
     outln("\n# PrototypeChainValidity layout");
@@ -194,7 +199,7 @@ int main()
     EMIT_OFFSET(TYPED_ARRAY_ARRAY_LENGTH, TypedArrayBase, m_array_length);
     EMIT_OFFSET(TYPED_ARRAY_BYTE_OFFSET, TypedArrayBase, m_byte_offset);
     EMIT_OFFSET(TYPED_ARRAY_KIND, TypedArrayBase, m_kind);
-    EMIT_OFFSET(TYPED_ARRAY_VIEWED_BUFFER, TypedArrayBase, m_viewed_array_buffer);
+    EMIT_OFFSET(TYPED_ARRAY_CACHED_DATA_PTR, TypedArrayBase, m_data);
 
     // ByteLength (Variant<Auto, Detached, u32>) layout
     outln("\n# ByteLength layout");
@@ -207,42 +212,6 @@ int main()
         // Variant<Auto, Detached, u32> stores m_data[4] then m_index (u8)
         outln("const TYPED_ARRAY_ARRAY_LENGTH_VALUE = {}", ta_al);     // u32 data at start
         outln("const TYPED_ARRAY_ARRAY_LENGTH_INDEX = {}", ta_al + 4); // index byte after 4 bytes of data
-    }
-
-    // ArrayBuffer layout
-    outln("\n# ArrayBuffer layout");
-    EMIT_OFFSET(ARRAY_BUFFER_DATA_BLOCK, ArrayBuffer, m_data_block);
-    {
-        auto ab_data_block = offsetof(ArrayBuffer, m_data_block);
-        auto db_byte_buffer = offsetof(DataBlock, byte_buffer);
-        outln("const ARRAY_BUFFER_BYTE_BUFFER = {}", ab_data_block + db_byte_buffer);
-        outln("const ARRAY_BUFFER_BYTE_BUFFER_OFFSET = {}", ab_data_block + db_byte_buffer);
-        // Find the actual offset of the Variant index byte by creating a known variant
-        // and scanning for the index value.
-        {
-            decltype(DataBlock::byte_buffer) v_empty;              // index = 0 (Empty)
-            decltype(DataBlock::byte_buffer) v_bb = ByteBuffer {}; // index = 1 (ByteBuffer)
-            auto const* p0 = reinterpret_cast<u8 const*>(&v_empty);
-            auto const* p1 = reinterpret_cast<u8 const*>(&v_bb);
-            size_t index_offset = 0;
-            for (size_t i = sizeof(v_empty); i-- > 0;) {
-                if (p0[i] == 0 && p1[i] == 1) {
-                    index_offset = i;
-                    break;
-                }
-            }
-            outln("const ARRAY_BUFFER_BYTE_BUFFER_VARIANT_INDEX = {}", ab_data_block + db_byte_buffer + index_offset);
-        }
-        outln("const ARRAY_BUFFER_BYTE_BUFFER_BYTEBUFFER_INDEX = 1");
-        auto bb_start = ab_data_block + db_byte_buffer;
-        outln("const ARRAY_BUFFER_BYTE_BUFFER_INLINE = {}", bb_start + offsetof(ByteBuffer, m_inline));
-        outln("const ARRAY_BUFFER_BYTE_BUFFER_OUTLINE_POINTER = {}", bb_start); // m_outline_buffer at offset 0 in union
-    }
-
-    // ArrayBuffer: check if buffer is fixed-length (not resizable)
-    {
-        outln("const ARRAY_BUFFER_IS_FIXED_LENGTH_OFFSET = {}",
-            offsetof(ArrayBuffer, m_data_block) + sizeof(DataBlock) + sizeof(size_t));
     }
 
     // TypedArrayBase::Kind enum values

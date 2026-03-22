@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::parser::{AsmInstruction, Handler, Operand, Program};
+use crate::parser::{AsmInstruction, Handler, ObjectFormat, Operand, Program};
 use crate::registers::{resolve_register, Arch};
-use crate::shared::{get_immediate_value, resolve_field_ref, resolve_label, substitute_macro, w, HandlerState};
+use crate::shared::{get_immediate_value, resolve_field_ref, resolve_label, substitute_macro, uniquify_macro_labels, w, HandlerState};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -65,6 +65,8 @@ pub fn generate(program: &Program) -> String {
     w!(out, ".text");
     w!(out);
 
+    emit_proc_start(&mut out);
+
     // Generate entry point
     generate_entry_point(&mut out, program);
 
@@ -76,29 +78,92 @@ pub fn generate(program: &Program) -> String {
         generate_handler(&mut out, handler, program);
     }
 
+    generate_exit_point(&mut out, program.object_format);
+    emit_proc_end(&mut out);
+    emit_file_trailer(&mut out);
+
+    out
+}
+
+fn emit_proc_start(out: &mut String) {
+    // Start one unwind-covered region for the entire monolithic interpreter
+    // blob, from the entry label through the last handler.
+    w!(out, ".globl CSYM(asm_interpreter_entry)");
+    w!(out, ".p2align 4");
+    w!(out, "CSYM(asm_interpreter_entry):");
+    w!(out, "    .cfi_startproc");
+}
+
+fn emit_proc_end(out: &mut String) {
+    // Close the interpreter's unwind frame after the last handler so any PC
+    // within the handler blob can unwind back to the C++ caller.
+    w!(out, ".cfi_endproc");
+    w!(out);
+}
+
+fn emit_file_trailer(out: &mut String) {
     // Mark stack as non-executable (required by Linux linker)
     w!(out, "#ifndef __APPLE__");
     w!(out, ".section .note.GNU-stack,\"\",@progbits");
     w!(out, "#endif");
+}
 
-    out
+fn generate_exit_point(out: &mut String, fmt: ObjectFormat) {
+    // Shared exit path: restore callee-saved registers and return.
+    // Keep this at the end of the proc so its CFI state does not affect
+    // later handler PCs. Mach-O's assembler rejects epilogue CFI directives,
+    // so only emit those for ELF.
+    w!(out, ".Lexit:");
+    w!(out, "    add rsp, 8");
+    w!(out, "    pop r15");
+    if matches!(fmt, ObjectFormat::Elf) {
+        w!(out, "    .cfi_restore r15");
+    }
+    w!(out, "    pop r14");
+    if matches!(fmt, ObjectFormat::Elf) {
+        w!(out, "    .cfi_restore r14");
+    }
+    w!(out, "    pop r13");
+    if matches!(fmt, ObjectFormat::Elf) {
+        w!(out, "    .cfi_restore r13");
+    }
+    w!(out, "    pop r12");
+    if matches!(fmt, ObjectFormat::Elf) {
+        w!(out, "    .cfi_restore r12");
+    }
+    w!(out, "    pop rbx");
+    if matches!(fmt, ObjectFormat::Elf) {
+        w!(out, "    .cfi_restore rbx");
+    }
+    w!(out, "    pop rbp");
+    if matches!(fmt, ObjectFormat::Elf) {
+        w!(out, "    .cfi_restore rbp");
+        w!(out, "    .cfi_def_cfa rsp, 8");
+    }
+    w!(out, "    ret");
+    w!(out);
 }
 
 fn generate_entry_point(out: &mut String, program: &Program) {
     // void asm_interpreter_entry(u8 const* bytecode, u32 entry_point, Value* values, Interpreter* interp)
     // System V AMD64: rdi=bytecode, esi=entry_point, rdx=values, rcx=interp
-    w!(out, ".globl CSYM(asm_interpreter_entry)");
-    w!(out, ".p2align 4");
-    w!(out, "CSYM(asm_interpreter_entry):");
 
     // Save callee-saved registers
     w!(out, "    push rbp");
+    w!(out, "    .cfi_def_cfa_offset 16");
+    w!(out, "    .cfi_offset rbp, -16");
     w!(out, "    mov rbp, rsp");
+    w!(out, "    .cfi_def_cfa_register rbp");
     w!(out, "    push rbx");
+    w!(out, "    .cfi_offset rbx, -24");
     w!(out, "    push r12");
+    w!(out, "    .cfi_offset r12, -32");
     w!(out, "    push r13");
+    w!(out, "    .cfi_offset r13, -40");
     w!(out, "    push r14");
+    w!(out, "    .cfi_offset r14, -48");
     w!(out, "    push r15");
+    w!(out, "    .cfi_offset r15, -56");
     // Align stack to 16 bytes (pushed rbp + 5 regs = 48 bytes, need one more for alignment)
     w!(out, "    sub rsp, 8");
 
@@ -153,16 +218,7 @@ fn generate_fallback_handler(out: &mut String, program: &Program) {
     emit_dispatch(out);
     w!(out);
 
-    // Exit path: restore callee-saved registers and return
-    w!(out, ".Lexit:");
-    w!(out, "    add rsp, 8");
-    w!(out, "    pop r15");
-    w!(out, "    pop r14");
-    w!(out, "    pop r13");
-    w!(out, "    pop r12");
-    w!(out, "    pop rbx");
-    w!(out, "    pop rbp");
-    w!(out, "    ret");
+    // Shared exit path is emitted at the end of the proc.
     w!(out);
 }
 
@@ -333,8 +389,13 @@ fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, 
                     param_map.insert(param.clone(), resolve_op(op, handler, program));
                 }
             }
+            // Uniquify local labels so the same macro can be used multiple
+            // times in one handler without label collisions.
+            let id = state.unique_counter;
+            state.unique_counter += 1;
+            let body = uniquify_macro_labels(&mac.body, id);
             // Expand macro body
-            for body_insn in &mac.body {
+            for body_insn in &body {
                 let expanded = substitute_macro(body_insn, &param_map);
                 emit_instruction(out, &expanded, handler, program, state);
             }
@@ -443,16 +504,20 @@ fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, 
         // js_to_int32 dst, src_fpr, fail_label
         // Truncate double to int64. cvttsd2si returns 0x8000000000000000 on
         // overflow/NaN, which we detect and branch to the slow path.
+        // On success, zero-extend the low 32 bits so callers can use
+        // box_int32_clean directly.
         // Clobbers rcx (t1).
         "js_to_int32" => {
             if insn.operands.len() >= 3 {
                 let dst = resolve_op(&insn.operands[0], handler, program);
+                let dst32 = to_32bit_reg(&dst);
                 let src = resolve_op(&insn.operands[1], handler, program);
                 let fail = resolve_label(&insn.operands[2], handler);
                 w!(out, "    cvttsd2si {dst}, {src}");
                 w!(out, "    mov rcx, 0x8000000000000000");
                 w!(out, "    cmp {dst}, rcx");
                 w!(out, "    je {fail}");
+                w!(out, "    mov {dst32}, {dst32}");
             }
         }
 
@@ -543,6 +608,24 @@ fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, 
                 .map(|o| resolve_op(o, handler, program))
                 .collect();
             w!(out, "    cvtsi2sd {}", ops.join(", "));
+        }
+
+        "float_to_double" => {
+            let ops: Vec<String> = insn
+                .operands
+                .iter()
+                .map(|o| resolve_op(o, handler, program))
+                .collect();
+            w!(out, "    cvtss2sd {}", ops.join(", "));
+        }
+
+        "double_to_float" => {
+            let ops: Vec<String> = insn
+                .operands
+                .iter()
+                .map(|o| resolve_op(o, handler, program))
+                .collect();
+            w!(out, "    cvtsd2ss {}", ops.join(", "));
         }
 
         // canonicalize_nan dst_gpr, src_fpr
@@ -642,6 +725,15 @@ fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, 
             }
         }
 
+        // loadf32 dst_fpr, [base, offset] - Load 32-bit float from memory
+        "loadf32" => {
+            if insn.operands.len() >= 2 {
+                let dst = resolve_op(&insn.operands[0], handler, program);
+                let mem = resolve_op(&insn.operands[1], handler, program);
+                w!(out, "    movss {dst}, DWORD PTR {mem}");
+            }
+        }
+
         // load32 dst_reg, [base, offset] - Load 32-bit value (zero-extended to 64-bit)
         "load32" => {
             if insn.operands.len() >= 2 {
@@ -689,6 +781,15 @@ fn emit_instruction(out: &mut String, insn: &AsmInstruction, handler: &Handler, 
                 let dst32 = to_32bit_reg(&dst);
                 let mem = resolve_op(&insn.operands[1], handler, program);
                 w!(out, "    movsx {dst32}, WORD PTR {mem}");
+            }
+        }
+
+        // storef32 [base, offset], src_fpr - Store 32-bit float to memory
+        "storef32" => {
+            if insn.operands.len() >= 2 {
+                let mem = resolve_op(&insn.operands[0], handler, program);
+                let src = resolve_op(&insn.operands[1], handler, program);
+                w!(out, "    movss DWORD PTR {mem}, {src}");
             }
         }
 

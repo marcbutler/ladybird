@@ -19,6 +19,7 @@
 #include <LibWeb/DOM/ParentNode.h>
 #include <LibWeb/DOM/PseudoElement.h>
 #include <LibWeb/DOM/QualifiedName.h>
+#include <LibWeb/DOM/RequestFullscreenError.h>
 #include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/AttributeNames.h>
@@ -271,6 +272,9 @@ public:
     };
     GC::Ref<WebIDL::Promise> request_fullscreen(FullscreenRequester = FullscreenRequester::Bindings);
 
+    RequestFullscreenError is_element_allowed_to_enter_fullscreen(FullscreenRequester) const;
+    bool is_element_ready_for_fullscreen() const;
+
     void set_fullscreen_flag(bool is_fullscreen) { m_fullscreen_flag = is_fullscreen; }
     bool is_fullscreen_element() const { return m_fullscreen_flag; }
 
@@ -284,7 +288,11 @@ public:
     WebIDL::ExceptionOr<void> set_outer_html(TrustedTypes::TrustedHTMLOrString const&);
 
     bool is_focused() const;
-    bool is_active() const;
+    bool is_the_active_element() const;
+
+    bool is_being_activated() const;
+    virtual void set_being_activated(bool);
+
     bool is_target() const;
     bool is_document_element() const;
 
@@ -310,6 +318,8 @@ public:
     }
     bool style_uses_if_css_function() const { return m_style_uses_if_css_function; }
     void set_style_uses_if_css_function() { m_style_uses_if_css_function = true; }
+    bool style_uses_inherit_css_function() const { return m_style_uses_inherit_css_function; }
+    void set_style_uses_inherit_css_function() { m_style_uses_inherit_css_function = true; }
 
     bool child_style_uses_tree_counting_function() const { return m_child_style_uses_tree_counting_function; }
     void set_child_style_uses_tree_counting_function() { m_child_style_uses_tree_counting_function = true; }
@@ -579,7 +589,7 @@ protected:
     virtual void removed_from(Node* old_parent, Node& old_root) override;
     virtual void moved_from(GC::Ptr<Node> old_parent) override;
 
-    virtual void children_changed(ChildrenChangedMetadata const*) override;
+    virtual void children_changed(ChildrenChangedMetadata const&) override;
     virtual i32 default_tab_index_value() const;
 
     // https://dom.spec.whatwg.org/#concept-element-attributes-change-ext
@@ -600,18 +610,7 @@ private:
 
     void invalidate_style_after_attribute_change(FlyString const& attribute_name, Optional<String> const& old_value, Optional<String> const& new_value);
 
-    enum class RequestFullscreenError : u8 {
-        False,
-        ElementReadyCheckFailed,
-        UnsupportedElement,
-        NoTransientUserActivation,
-        ElementNodeDocIsNotPendingDoc
-    };
-    static Utf16String request_fullscreen_error_to_string(RequestFullscreenError);
-
     void exit_fullscreen_on_element_removal();
-    RequestFullscreenError is_element_allowed_to_enter_fullscreen(FullscreenRequester) const;
-    bool is_element_ready_for_fullscreen() const;
 
     WebIDL::ExceptionOr<GC::Ptr<Node>> insert_adjacent(StringView where, GC::Ref<Node> node);
 
@@ -682,12 +681,14 @@ private:
 
     CSSPixelPoint m_scroll_offset;
 
+    bool m_is_being_activated : 1 { false };
     bool m_in_top_layer : 1 { false };
     bool m_rendered_in_top_layer : 1 { false };
     bool m_style_uses_attr_css_function : 1 { false };
     bool m_style_uses_var_css_function : 1 { false };
     bool m_style_uses_tree_counting_function : 1 { false };
     bool m_style_uses_if_css_function : 1 { false };
+    bool m_style_uses_inherit_css_function : 1 { false };
     bool m_child_style_uses_tree_counting_function : 1 { false };
     bool m_affected_by_has_pseudo_class_in_subject_position : 1 { false };
     bool m_affected_by_has_pseudo_class_in_non_subject_position : 1 { false };

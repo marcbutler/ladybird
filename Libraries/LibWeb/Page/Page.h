@@ -10,6 +10,8 @@
 #pragma once
 
 #include <AK/JsonValue.h>
+#include <AK/Queue.h>
+#include <AK/Variant.h>
 #include <LibGC/Root.h>
 #include <LibGC/Weak.h>
 #include <LibGfx/Cursor.h>
@@ -23,6 +25,7 @@
 #include <LibHTTP/Forward.h>
 #include <LibHTTP/Header.h>
 #include <LibIPC/Forward.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibURL/URL.h>
@@ -30,6 +33,7 @@
 #include <LibWeb/CSS/PreferredColorScheme.h>
 #include <LibWeb/CSS/PreferredContrast.h>
 #include <LibWeb/CSS/PreferredMotion.h>
+#include <LibWeb/DOM/RequestFullscreenError.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/ActivateTab.h>
@@ -42,6 +46,7 @@
 #include <LibWeb/Loader/FileRequest.h>
 #include <LibWeb/Page/EventResult.h>
 #include <LibWeb/Page/InputEvent.h>
+#include <LibWeb/Page/ViewportIsFullscreen.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWeb/PixelUnits.h>
 #include <LibWeb/StorageAPI/StorageEndpoint.h>
@@ -98,12 +103,10 @@ public:
     ChromeMetrics chrome_metrics() const;
 
     EventResult handle_mouseup(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
-    EventResult handle_mousedown(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
+    EventResult handle_mousedown(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count);
     EventResult handle_mousemove(DevicePixelPoint, DevicePixelPoint screen_position, unsigned buttons, unsigned modifiers);
     EventResult handle_mouseleave();
     EventResult handle_mousewheel(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, DevicePixels wheel_delta_x, DevicePixels wheel_delta_y);
-    EventResult handle_doubleclick(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
-    EventResult handle_tripleclick(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
 
     EventResult handle_drag_and_drop_event(DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
     EventResult handle_pinch_event(DevicePixelPoint point, double scale);
@@ -245,6 +248,13 @@ public:
     bool listen_for_dom_mutations() const { return m_listen_for_dom_mutations; }
     void set_listen_for_dom_mutations(bool listen_for_dom_mutations) { m_listen_for_dom_mutations = listen_for_dom_mutations; }
 
+    void enqueue_fullscreen_enter(GC::Ref<DOM::Element>, GC::Ref<DOM::Document>, DOM::RequestFullscreenError, GC::Ref<WebIDL::Promise>);
+    void enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::Ref<WebIDL::Promise>);
+    void process_pending_fullscreen_operations();
+
+    ViewportIsFullscreen viewport_is_fullscreen() const { return m_viewport_is_fullscreen; }
+    void set_viewport_is_fullscreen(ViewportIsFullscreen);
+
 private:
     explicit Page(GC::Ref<PageClient>);
     virtual void visit_edges(Visitor&) override;
@@ -323,6 +333,26 @@ private:
     URL::URL m_last_find_in_page_url;
 
     bool m_listen_for_dom_mutations { false };
+
+    struct PendingFullscreenEnter {
+        GC::Ref<DOM::Element> element;
+        GC::Ref<DOM::Document> pending_doc;
+        DOM::RequestFullscreenError error;
+        GC::Ref<WebIDL::Promise> promise;
+    };
+
+    struct PendingFullscreenExit {
+        GC::Ref<DOM::Document> doc;
+        bool resize;
+        GC::Ref<WebIDL::Promise> promise;
+    };
+
+    using PendingFullscreenOperation = Variant<PendingFullscreenEnter, PendingFullscreenExit>;
+
+    Queue<PendingFullscreenOperation> m_pending_fullscreen_operations;
+    ViewportIsFullscreen m_viewport_is_fullscreen { ViewportIsFullscreen::No };
+    bool m_fullscreen_ipc_sent_to_ui { false };
+    bool m_processing_fullscreen_operations { false };
 };
 
 enum class DisplayListPlayerType {
@@ -439,7 +469,12 @@ public:
     virtual void page_did_receive_network_response_body([[maybe_unused]] u64 request_id, [[maybe_unused]] ReadonlyBytes data) { }
     virtual void page_did_finish_network_request([[maybe_unused]] u64 request_id, [[maybe_unused]] u64 body_size, [[maybe_unused]] Requests::RequestTimingInfo const& timing_info, [[maybe_unused]] Optional<Requests::NetworkError> const& network_error) { }
 
-    virtual IPC::File request_worker_agent([[maybe_unused]] Web::Bindings::AgentType worker_type) { return IPC::File {}; }
+    struct WorkerAgentResponse {
+        IPC::TransportHandle worker_handle;
+        IPC::TransportHandle request_server_handle;
+        IPC::TransportHandle image_decoder_handle;
+    };
+    virtual WorkerAgentResponse request_worker_agent([[maybe_unused]] Web::Bindings::AgentType worker_type) { return {}; }
 
     virtual void page_did_mutate_dom([[maybe_unused]] FlyString const& type, [[maybe_unused]] DOM::Node const& target, [[maybe_unused]] DOM::NodeList& added_nodes, [[maybe_unused]] DOM::NodeList& removed_nodes, [[maybe_unused]] GC::Ptr<DOM::Node> previous_sibling, [[maybe_unused]] GC::Ptr<DOM::Node> next_sibling, [[maybe_unused]] Optional<String> const& attribute_name) { }
 

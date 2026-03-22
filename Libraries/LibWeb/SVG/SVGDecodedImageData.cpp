@@ -69,6 +69,11 @@ ErrorOr<GC::Ref<SVGDecodedImageData>> SVGDecodedImageData::create(JS::Realm& rea
     if (result.is_error())
         dbgln("SVGDecodedImageData: Failed to parse SVG: {}", result.error());
 
+    // Mark the document as completely loaded so that <use> elements
+    // (which defer cloning until the document is complete) resolve
+    // forward references to elements parsed after them.
+    document->completely_finish_loading();
+
     auto* svg_root = document->first_child_of_type<SVG::SVGSVGElement>();
     if (!svg_root) {
         dbgln("SVGDecodedImageData: Invalid SVG input (no SVGSVGElement found)");
@@ -118,7 +123,7 @@ RefPtr<Gfx::PaintingSurface> SVGDecodedImageData::render_to_surface(Gfx::IntSize
     if (m_cached_rendered_surfaces.size() > 10)
         m_cached_rendered_surfaces.remove(m_cached_rendered_surfaces.begin());
 
-    auto surface = Gfx::PaintingSurface::create_with_size(m_document->navigable()->skia_backend_context(), size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied);
+    auto surface = Gfx::PaintingSurface::create_with_size(size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied);
     auto display_list = record_display_list(size);
     if (!display_list)
         return nullptr;

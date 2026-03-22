@@ -1664,7 +1664,7 @@ bool Document::layout_is_up_to_date() const
         //        include media conditions, or b) the data used to resolve media queries hasn't changed.
         bool const needs_style_update_due_to_if_media = element.style_uses_if_css_function();
 
-        if (needs_full_style_update || node.needs_style_update() || parent_display_changed || (recompute_elements_depending_on_custom_properties && element.style_uses_var_css_function()) || needs_style_update_due_to_if_media) {
+        if (needs_full_style_update || node.needs_style_update() || parent_display_changed || (recompute_elements_depending_on_custom_properties && (element.style_uses_var_css_function() || element.style_uses_inherit_css_function())) || needs_style_update_due_to_if_media) {
             node_invalidation = element.recompute_style(did_change_custom_properties);
         } else if (needs_inherited_style_update) {
             node_invalidation = element.recompute_inherited_style();
@@ -2730,7 +2730,7 @@ WebIDL::ExceptionOr<GC::Ref<Node>> Document::adopt_node_binding(GC::Ref<Node> no
     if (is<ShadowRoot>(*node))
         return WebIDL::HierarchyRequestError::create(realm(), "Cannot adopt a shadow root into a document"_utf16);
 
-    if (is<DocumentFragment>(*node) && as<DocumentFragment>(*node).host())
+    if (auto* fragment = as_if<DocumentFragment>(*node); fragment && fragment->host())
         return node;
 
     adopt_node(*node);
@@ -2828,26 +2828,6 @@ void Document::set_active_element(GC::Ptr<Element> element)
 {
     if (m_active_element.ptr() == element)
         return;
-
-    auto old_active_element = move(m_active_element);
-    auto* common_ancestor = find_common_ancestor(old_active_element, element);
-
-    GC::Ptr<Node> old_active_node_root = nullptr;
-    GC::Ptr<Node> new_active_node_root = nullptr;
-    if (old_active_element)
-        old_active_node_root = old_active_element->root();
-    if (element)
-        new_active_node_root = element->root();
-    if (old_active_node_root != new_active_node_root) {
-        if (old_active_node_root) {
-            invalidate_style_for_elements_affected_by_pseudo_class_change(CSS::PseudoClass::Active, m_active_element, *old_active_node_root, element);
-        }
-        if (new_active_node_root) {
-            invalidate_style_for_elements_affected_by_pseudo_class_change(CSS::PseudoClass::Active, m_active_element, *new_active_node_root, element);
-        }
-    } else {
-        invalidate_style_for_elements_affected_by_pseudo_class_change(CSS::PseudoClass::Active, m_active_element, *common_ancestor, element);
-    }
 
     m_active_element = element;
 
@@ -3711,7 +3691,7 @@ void Document::update_the_visibility_state(HTML::VisibilityState visibility_stat
     dispatch_event(event);
 }
 
-// https://drafts.csswg.org/cssom-view/#run-the-resize-steps
+// https://drafts.csswg.org/cssom-view/#document-run-the-resize-steps
 void Document::run_the_resize_steps()
 {
     // 1. If doc’s viewport has had its width or height changed
@@ -3726,19 +3706,27 @@ void Document::run_the_resize_steps()
     VisualViewportState visual_viewport_state = { visual_viewport.scale(), { visual_viewport.width(), visual_viewport.height() } };
     bool is_initial_size = !m_last_viewport_size.has_value();
 
-    if (m_last_viewport_size == viewport_size && m_last_visual_viewport_state == visual_viewport_state)
+    bool viewport_size_changed = m_last_viewport_size != viewport_size;
+    bool visual_viewport_state_changed = m_last_visual_viewport_state != visual_viewport_state;
+
+    if (!viewport_size_changed && !visual_viewport_state_changed)
         return;
+
     m_last_viewport_size = viewport_size;
     m_last_visual_viewport_state = visual_viewport_state;
 
     if (!is_initial_size) {
-        auto window_resize_event = DOM::Event::create(realm(), UIEvents::EventNames::resize);
-        window_resize_event->set_is_trusted(true);
-        window()->dispatch_event(window_resize_event);
+        if (viewport_size_changed) {
+            auto window_resize_event = DOM::Event::create(realm(), UIEvents::EventNames::resize);
+            window_resize_event->set_is_trusted(true);
+            window()->dispatch_event(window_resize_event);
+        }
 
-        auto visual_viewport_resize_event = DOM::Event::create(realm(), UIEvents::EventNames::resize);
-        visual_viewport_resize_event->set_is_trusted(true);
-        visual_viewport.dispatch_event(visual_viewport_resize_event);
+        if (visual_viewport_state_changed) {
+            auto visual_viewport_resize_event = DOM::Event::create(realm(), UIEvents::EventNames::resize);
+            visual_viewport_resize_event->set_is_trusted(true);
+            visual_viewport.dispatch_event(visual_viewport_resize_event);
+        }
     }
 }
 
@@ -4544,9 +4532,7 @@ void Document::destroy()
         return task.document() == this;
     });
 
-    // AD-HOC: Mark this document as destroyed. This makes any tasks scheduled for this document in the
-    //         future immediately runnable instead of blocking on the document becoming fully active.
-    //         This is important because otherwise those tasks will get stuck in the task queue forever.
+    // AD-HOC: Mark this document as destroyed so we can remove tasks from the queue that will never be able to run.
     m_has_been_destroyed = true;
 
     // 8. Set document's browsing context to null.
@@ -4581,104 +4567,103 @@ void Document::make_unsalvageable([[maybe_unused]] String reason)
     set_salvageable(false);
 }
 
-struct DocumentDestructionState : public GC::Cell {
-    GC_CELL(DocumentDestructionState, GC::Cell);
-    GC_DECLARE_ALLOCATOR(DocumentDestructionState);
+struct DocumentLifecycleState : public GC::Cell {
+    GC_CELL(DocumentLifecycleState, GC::Cell);
+    GC_DECLARE_ALLOCATOR(DocumentLifecycleState);
 
     static constexpr int TIMEOUT_MS = 15000;
 
-    DocumentDestructionState(GC::Ref<Document> document, size_t remaining, GC::Ptr<GC::Function<void()>> after)
+    DocumentLifecycleState(GC::Ref<Document> document, size_t remaining, GC::Ref<GC::Function<void()>> finish_callback)
         : remaining_children(remaining)
         , document(document)
-        , after_all(after)
+        , finish_callback(finish_callback)
         , timeout(Platform::Timer::create_single_shot(heap(), TIMEOUT_MS, GC::create_function(heap(), [this] {
             if (remaining_children > 0)
-                dbgln("FIXME: Document destruction timed out with {} remaining children", remaining_children);
+                dbgln("FIXME: Document unload/destruction timed out with {} remaining children", remaining_children);
         })))
     {
         timeout->start();
     }
 
-    virtual void visit_edges(GC::Cell::Visitor& visitor) override
+    virtual void visit_edges(Visitor& visitor) override
     {
         Base::visit_edges(visitor);
         visitor.visit(document);
-        visitor.visit(after_all);
+        visitor.visit(finish_callback);
         visitor.visit(timeout);
     }
 
-    void increment_destroyed()
+    void did_process_child()
     {
-        --remaining_children;
-        if (remaining_children > 0)
+        if (--remaining_children > 0)
             return;
         timeout->stop();
-        queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(document), GC::create_function(heap(), [document = move(document), after_all = move(after_all)] {
-            document->destroy();
-            if (after_all)
-                after_all->function()();
-        }));
+        queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(document), finish_callback);
     }
 
     size_t remaining_children { 0 };
     GC::Ref<Document> document;
-    GC::Ptr<GC::Function<void()>> after_all;
+    GC::Ref<GC::Function<void()>> finish_callback;
     GC::Ref<Platform::Timer> timeout;
 };
 
-GC_DEFINE_ALLOCATOR(DocumentDestructionState);
+GC_DEFINE_ALLOCATOR(DocumentLifecycleState);
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document-and-its-descendants
 void Document::destroy_a_document_and_its_descendants(GC::Ptr<GC::Function<void()>> after_all_destruction)
 {
     // 1. If document is not fully active, then:
     if (!is_fully_active()) {
-        // 1. Let reason be a string from user-agent specific blocking reasons.
-        //    If none apply, then let reason be "masked".
+        // 1. Let reason be a string from user-agent specific blocking reasons. If none apply, then let reason be
+        //    "masked".
         // FIXME: user-agent specific blocking reasons.
         auto reason = "masked"_string;
 
         // 2. Make document unsalvageable given document and reason.
         make_unsalvageable(reason);
 
-        // FIXME: 3. If document's node navigable is a top-level traversable,
-        //           build not restored reasons for a top-level traversable and its descendants given document's node navigable.
+        // FIXME: 3. If document's node navigable is a top-level traversable, build not restored reasons for a top-level
+        //    traversable and its descendants given document's node navigable.
     }
 
     // 2. Let childNavigables be document's child navigables.
-    IGNORE_USE_IN_ESCAPING_LAMBDA auto child_navigables = document_tree_child_navigables();
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto child_navigables = navigable()->child_navigables();
 
-    // NOTE: Not in the spec but we could avoid allocating destruction state in case there's no child navigables.
+    // 6. Queue a global task on the navigation and traversal task source given document's relevant global object to
+    //    perform the following steps:
+    auto finish_callback = GC::create_function(heap(), [document = this, after_all_destruction] {
+        // 1. Destroy document.
+        document->destroy();
+
+        // 2. If afterAllDestruction was given, then run it.
+        if (after_all_destruction)
+            after_all_destruction->function()();
+    });
+
+    // AD-HOC: We avoid allocating a DocumentLifecycleState in case there's no child navigables.
     if (child_navigables.is_empty()) {
-        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(*this), GC::create_function(heap(), [document = this, after_all_destruction] {
-            // 1. Destroy document.
-            document->destroy();
-
-            // 2. If afterAllDestruction was given, then run it.
-            if (after_all_destruction)
-                after_all_destruction->function()();
-        }));
+        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(*this), finish_callback);
         return;
     }
 
     // 3. Let numberDestroyed be 0.
-    auto destruction_state = heap().allocate<DocumentDestructionState>(*this, child_navigables.size(), after_all_destruction);
+    auto destruction_state = heap().allocate<DocumentLifecycleState>(*this, child_navigables.size(), finish_callback);
 
     // 4. For each childNavigable of childNavigables, queue a global task on the navigation and traversal task source
     //    given childNavigable's active window to perform the following steps:
     for (auto& child_navigable : child_navigables) {
-        queue_global_task(HTML::Task::Source::NavigationAndTraversal, *child_navigable->active_window(), GC::create_function(heap(), [&heap = heap(), destruction_state, child_navigable] {
-            // 1. Let incrementDestroyed be an algorithm step which increments numberDestroyed.
-            auto increment_destroyed = GC::create_function(heap, [destruction_state] { destruction_state->increment_destroyed(); });
+        queue_global_task(HTML::Task::Source::NavigationAndTraversal, *child_navigable->active_window(),
+            GC::create_function(heap(), [&heap = heap(), destruction_state, child_navigable] {
+                // 1. Let incrementDestroyed be an algorithm step which increments numberDestroyed.
+                auto increment_destroyed = GC::create_function(heap, [destruction_state] { destruction_state->did_process_child(); });
 
-            // 2. Destroy a document and its descendants given childNavigable's active document and incrementDestroyed.
-            child_navigable->active_document()->destroy_a_document_and_its_descendants(increment_destroyed);
-        }));
+                // 2. Destroy a document and its descendants given childNavigable's active document and incrementDestroyed.
+                child_navigable->active_document()->destroy_a_document_and_its_descendants(increment_destroyed);
+            }));
     }
 
-    // NOTE: Both of subsequent steps are handled by DocumentDestructionState.
     // 5. Wait until numberDestroyed equals childNavigable's size.
-    // 6. Queue a global task on the navigation and traversal task source given document's relevant global object to perform the following steps:
+    // NB: This is handled by destruction_state.
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#abort-a-document
@@ -4757,8 +4742,6 @@ GC::Ptr<HTML::HTMLParser> Document::active_parser()
 
 void Document::set_browsing_context(GC::Ptr<HTML::BrowsingContext> browsing_context)
 {
-    if (browsing_context)
-        m_has_been_browsing_context_associated = true;
     m_browsing_context = browsing_context;
 }
 
@@ -4771,10 +4754,11 @@ void Document::unload(GC::Ptr<Document>)
 
     // FIXME: 3. If newDocument is not given, then set unloadTimingInfo to null.
 
-    // FIXME: 4. Otherwise, if newDocument's event loop is not oldDocument's event loop, then the user agent may be unloading oldDocument in parallel. In that case, the user agent should
-    //           set unloadTimingInfo to null.
+    // FIXME: 4. Otherwise, if newDocument's event loop is not oldDocument's event loop, then the user agent may be unloading
+    //    oldDocument in parallel. In that case, the user agent should set unloadTimingInfo to null.
 
-    // 5. Let intendToStoreInBfcache be true if the user agent intends to keep oldDocument alive in a session history entry, such that it can later be used for history traversal.
+    // 5. Let intendToStoreInBfcache be true if the user agent intends to keep oldDocument alive in a session history
+    //    entry, such that it can later be used for history traversal.
     auto intend_to_store_in_bfcache = false;
 
     // 6. Let eventLoop be oldDocument's relevant agent's event loop.
@@ -4787,26 +4771,28 @@ void Document::unload(GC::Ptr<Document>)
     m_unload_counter += 1;
 
     // 9. If intendToKeepInBfcache is false, then set oldDocument's salvageable state to false.
-    if (!intend_to_store_in_bfcache) {
+    if (!intend_to_store_in_bfcache)
         m_salvageable = false;
-    }
 
     // 10. If oldDocument's page showing is true:
     if (m_page_showing) {
         // 1. Set oldDocument's page showing to false.
         m_page_showing = false;
 
-        // 2. Fire a page transition event named pagehide at oldDocument's relevant global object with oldDocument's salvageable state.
+        // 2. Fire a page transition event named pagehide at oldDocument's relevant global object with oldDocument's
+        //    salvageable state.
         as<HTML::Window>(relevant_global_object(*this)).fire_a_page_transition_event(HTML::EventNames::pagehide, m_salvageable);
 
         // 3. Update the visibility state of oldDocument to "hidden".
         update_the_visibility_state(HTML::VisibilityState::Hidden);
     }
 
-    // FIXME: 11. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event start time to the current high resolution time given newDocument's relevant global object, coarsened
-    //            given oldDocument's relevant settings object's cross-origin isolated capability.
+    // FIXME: 11. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event start time to the current high
+    //     resolution time given newDocument's relevant global object, coarsened given oldDocument's relevant settings
+    //     object's cross-origin isolated capability.
 
-    // 12. If oldDocument's salvageable state is false, then fire an event named unload at oldDocument's relevant global object, with legacy target override flag set.
+    // 12. If oldDocument's salvageable state is false, then fire an event named unload at oldDocument's relevant global
+    //     object, with legacy target override flag set.
     if (!m_salvageable) {
         // then fire an event named unload at document's relevant global object, with legacy target override flag set.
         // FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
@@ -4815,8 +4801,9 @@ void Document::unload(GC::Ptr<Document>)
         as<HTML::Window>(relevant_global_object(*this)).dispatch_event(event);
     }
 
-    // FIXME: 13. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event end time to the current high resolution time given newDocument's relevant global object, coarsened
-    //            given oldDocument's relevant settings object's cross-origin isolated capability.
+    // FIXME: 13. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event end time to the current high
+    //     resolution time given newDocument's relevant global object, coarsened given oldDocument's relevant settings
+    //     object's cross-origin isolated capability.
 
     // 14. Decrease eventLoop's termination nesting level by 1.
     event_loop.decrement_termination_nesting_level();
@@ -4827,18 +4814,19 @@ void Document::unload(GC::Ptr<Document>)
 
     // FIXME: 17. Set oldDocument's has been scrolled by the user to false.
 
-    // FIXME: 18. Run any unloading document cleanup steps for oldDocument that are defined by this specification and other applicable specifications.
+    // FIXME: 18. Run any unloading document cleanup steps for oldDocument that are defined by this specification and other
+    //     applicable specifications.
 
     // 19. If oldDocument's salvageable state is false, then destroy oldDocument.
-    if (!m_salvageable) {
-        // NOTE: Document is destroyed from Document::unload_a_document_and_its_descendants()
-    }
+    if (!m_salvageable)
+        destroy();
 
     // 20. Decrease oldDocument's unload counter by 1.
     m_unload_counter -= 1;
 
-    // FIXME: 21. If newDocument is given, newDocument's was created via cross-origin redirects is false, and newDocument's origin is the same as oldDocument's origin, then set
-    //            newDocument's previous document unload timing to unloadTimingInfo.
+    // FIXME: 21. If newDocument is given, newDocument's was created via cross-origin redirects is false, and newDocument's
+    //     origin is the same as oldDocument's origin, then set newDocument's previous document unload timing to
+    //     unloadTimingInfo.
 
     did_stop_being_active_document_in_navigable();
 }
@@ -4846,66 +4834,49 @@ void Document::unload(GC::Ptr<Document>)
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document-and-its-descendants
 void Document::unload_a_document_and_its_descendants(GC::Ptr<Document> new_document, GC::Ptr<GC::Function<void()>> after_all_unloads)
 {
-    // Specification defines this algorithm in the following steps:
-    // 1. Recursively unload (and destroy) documents in descendant navigables
-    // 2. Unload (and destroy) this document.
-    //
-    // Implementation of the spec will fail in the following scenario:
-    // 1. Unload iframe's (has attribute name="test") document
-    //    1.1. Destroy iframe's document
-    // 2. Unload iframe's parent document
-    //    2.1. Dispatch "unload" event
-    //       2.2. In "unload" event handler run `window["test"]`
-    //          2.2.1. Execute Window::document_tree_child_navigable_target_name_property_set()
-    //             2.2.1.1. Fail to access iframe's navigable active document because it was destroyed on step 1.1
-    //
-    // We change the algorithm to:
-    // 1. Unload all descendant documents without destroying them
-    // 2. Unload this document
-    // 3. Destroy all descendant documents
-    // 4. Destroy this document
-    //
-    // This way we maintain the invariant that all navigable containers present in the DOM tree
-    // have an active document while the document is being unloaded.
+    // FIXME: 1. Assert: this is running within document's node navigable's traversable navigable's session history traversal
+    //    queue.
 
-    IGNORE_USE_IN_ESCAPING_LAMBDA size_t number_unloaded = 0;
+    // 2. Let childNavigables be document's child navigables.
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto child_navigables = navigable()->child_navigables();
 
-    auto navigable = this->navigable();
+    // 6. Queue a global task on the navigation and traversal task source given document's relevant global object to
+    //    perform the following steps:
+    auto finish_callback = GC::create_function(heap(), [document = this, new_document, after_all_unloads] {
+        // FIXME: 1. If firePageSwapSteps is given, then run firePageSwapSteps.
 
-    Vector<GC::Root<HTML::Navigable>> descendant_navigables;
-    for (auto& other_navigable : HTML::all_navigables()) {
-        // AD-HOC: Skip destroyed navigables. When an iframe is removed,
-        //         destroy_the_child_navigable() marks its navigable as destroyed
-        //         synchronously, but removal from all_navigables() happens later
-        //         in an async callback. If we count destroyed navigables here,
-        //         the unload tasks we queue for them can be removed by
-        //         Document::destroy() (which clears tasks for its document),
-        //         causing the spin_until below to wait forever.
-        if (other_navigable->has_been_destroyed())
-            continue;
-        if (navigable->is_ancestor_of(*other_navigable))
-            descendant_navigables.append(other_navigable);
+        // 2. Unload document, passing along newDocument if it is not null.
+        document->unload(new_document);
+
+        // 3. If afterAllUnloads was given, then run it.
+        if (after_all_unloads)
+            after_all_unloads->function()();
+    });
+
+    // AD-HOC: We avoid allocating a DocumentLifecycleState in case there's no child navigables.
+    if (child_navigables.is_empty()) {
+        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, relevant_global_object(*this), finish_callback);
+        return;
     }
 
-    IGNORE_USE_IN_ESCAPING_LAMBDA auto unloaded_documents_count = descendant_navigables.size() + 1;
+    // 3. Let numberUnloaded be 0.
+    auto unload_state = heap().allocate<DocumentLifecycleState>(*this, child_navigables.size(), finish_callback);
 
-    HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, HTML::relevant_global_object(*this), GC::create_function(heap(), [&number_unloaded, this, new_document] {
-        unload(new_document);
-        ++number_unloaded;
-    }));
+    // 4. For each childNavigable of childNavigables [[ in what order? ]], queue a global task on the navigation and
+    //    traversal task source given childNavigable's active window to perform the following steps:
+    for (auto& child_navigable : child_navigables) {
+        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, *child_navigable->active_window(),
+            GC::create_function(heap(), [&heap = heap(), unload_state, child_navigable = child_navigable.ptr()] {
+                // 1. Let incrementUnloaded be an algorithm step which increments numberUnloaded.
+                auto increment_unloaded = GC::create_function(heap, [unload_state] { unload_state->did_process_child(); });
 
-    for (auto& descendant_navigable : descendant_navigables) {
-        HTML::queue_global_task(HTML::Task::Source::NavigationAndTraversal, *descendant_navigable->active_window(), GC::create_function(heap(), [&number_unloaded, descendant_navigable = descendant_navigable.ptr()] {
-            descendant_navigable->active_document()->unload();
-            ++number_unloaded;
-        }));
+                // 2. Unload a document and its descendants given childNavigable's active document, null, and incrementUnloaded.
+                child_navigable->active_document()->unload_a_document_and_its_descendants({}, increment_unloaded);
+            }));
     }
 
-    HTML::main_thread_event_loop().spin_until(GC::create_function(heap(), [&] {
-        return number_unloaded == unloaded_documents_count;
-    }));
-
-    destroy_a_document_and_its_descendants(move(after_all_unloads));
+    // 5. Wait until numberUnloaded equals childNavigables's size.
+    // NB: This is handled by unload_state.
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#allowed-to-use
@@ -5060,6 +5031,14 @@ void Document::make_active()
     auto navigable = this->navigable();
     if (navigable) {
         m_visibility_state = navigable->traversable_navigable()->system_visibility_state();
+
+        // AD-HOC: Record the initial viewport and visual viewport state so that if the viewport changes before the
+        //         first rendering update (e.g. in our fullscreen tests), change events are still fired.
+        if (!m_last_viewport_size.has_value()) {
+            m_last_viewport_size = viewport_rect().size().to_type<int>();
+            auto& current_visual_viewport = *visual_viewport();
+            m_last_visual_viewport_state = VisualViewportState { current_visual_viewport.scale(), { current_visual_viewport.width(), current_visual_viewport.height() } };
+        }
     }
 
     // TODO: 4. Queue a new VisibilityStateEntry whose visibility state is document's visibility state and whose timestamp is zero.
@@ -6995,76 +6974,23 @@ GC::Ref<WebIDL::Promise> Document::exit_fullscreen()
     auto top_level_doc = navigable()->top_level_traversable()->active_document();
 
     // 6. If topLevelDoc is in docs, and it is a simple fullscreen document, then set doc to topLevelDoc and resize to true.
-    GC::Ref<Document> document_to_unfullscreen { *this };
+    GC::Ref<Document> doc { *this };
     if (top_level_doc && top_level_doc->is_simple_fullscreen_document() && docs->elements().contains_slow(GC::Ref { *top_level_doc })) {
-        document_to_unfullscreen = *top_level_doc;
+        doc = *top_level_doc;
         resize = true;
     }
 
     // 7. If doc’s fullscreen element is not connected:
-    if (auto fullscreen_element = document_to_unfullscreen->fullscreen_element(); !fullscreen_element->is_connected()) {
+    if (auto fullscreen_element = doc->fullscreen_element(); !fullscreen_element->is_connected()) {
         // 1. Append (fullscreenchange, doc’s fullscreen element) to doc’s list of pending fullscreen events.
-        document_to_unfullscreen->append_pending_fullscreen_change(PendingFullscreenEvent::Type::Change, *fullscreen_element);
+        doc->append_pending_fullscreen_change(PendingFullscreenEvent::Type::Change, *fullscreen_element);
 
         // 2. Unfullscreen doc’s fullscreen element.
-        document_to_unfullscreen->unfullscreen_element(*fullscreen_element);
+        doc->unfullscreen_element(*fullscreen_element);
     }
 
     // 8. Return promise, and run the remaining steps in parallel.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [&realm, document_to_unfullscreen, promise, resize] {
-        HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
-        // FIXME: 9. Run the fully unlock the screen orientation steps with doc.
-
-        // 10. If resize is true, resize doc’s viewport to its "normal" dimensions.
-        // NB: Fullscreen API is affected by site-isolation and will require additional work once site-isolation is implemented.
-        if (resize)
-            document_to_unfullscreen->page().client().page_did_request_exit_fullscreen();
-
-        // 11. If doc’s fullscreen element is null, then resolve promise with undefined and terminate these steps.
-        if (!document_to_unfullscreen->fullscreen_element()) {
-            WebIDL::resolve_promise(realm, promise, JS::js_undefined());
-            return;
-        }
-
-        // 12. Let exitDocs be the result of collecting documents to unfullscreen given doc.
-        auto exit_docs = document_to_unfullscreen->collect_documents_to_unfullscreen();
-
-        // 13. Let descendantDocs be an ordered set consisting of doc’s descendant navigables' active documents whose
-        //     fullscreen element is non-null, if any, in tree order.
-        auto descendant_docs = realm.heap().allocate<GC::HeapVector<GC::Ref<Document>>>();
-        for (auto& descendant : document_to_unfullscreen->descendant_navigables()) {
-            if (descendant->active_document()->fullscreen_element())
-                descendant_docs->elements().append(*descendant->active_document());
-        }
-
-        // 14. For each exitDoc in exitDocs:
-        for (auto& exit_doc : exit_docs->elements()) {
-            // 1. Append (fullscreenchange, exitDoc’s fullscreen element) to exitDoc’s list of pending fullscreen events.
-            exit_doc->append_pending_fullscreen_change(PendingFullscreenEvent::Type::Change, *exit_doc->fullscreen_element());
-
-            // 2. If resize is true, unfullscreen exitDoc.
-            if (resize)
-                exit_doc->unfullscreen();
-            // 3. Otherwise, unfullscreen exitDoc’s fullscreen element.
-            else
-                exit_doc->unfullscreen_element(*exit_doc->fullscreen_element());
-        }
-
-        // 15. For each descendantDoc in descendantDocs:
-        for (auto& descendant_doc : descendant_docs->elements()) {
-            // 1. Append (fullscreenchange, descendantDoc’s fullscreen element) to descendantDoc’s list of pending fullscreen events.
-            descendant_doc->append_pending_fullscreen_change(PendingFullscreenEvent::Type::Change, *descendant_doc->fullscreen_element());
-
-            // 2. Unfullscreen descendantDoc.
-            descendant_doc->unfullscreen();
-        }
-
-        // Note: The order in which documents are unfullscreened is not observable, because run the fullscreen steps is
-        //       invoked in tree order.
-
-        // 16. Resolve promise with undefined.
-        WebIDL::resolve_promise(realm, promise, JS::js_undefined());
-    }));
+    page().enqueue_fullscreen_exit(doc, resize, promise);
 
     return promise;
 }
@@ -7344,7 +7270,10 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
     if (m_cached_display_list && m_cached_display_list_paint_config == config)
         return m_cached_display_list;
 
-    auto display_list = Painting::DisplayList::create();
+    update_paint_and_hit_testing_properties_if_needed();
+    VERIFY(paintable());
+
+    auto display_list = Painting::DisplayList::create(*paintable()->visual_context_tree());
     Painting::DisplayListRecorder display_list_recorder(display_list);
 
     // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-effect
@@ -7380,16 +7309,11 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
         display_list_recorder.fill_rect(bitmap_rect, CSS::SystemColor::canvas(color_scheme));
 
     display_list_recorder.fill_rect(bitmap_rect, background_color());
-    if (!paintable()) {
-        VERIFY_NOT_REACHED();
-    }
 
     Web::DisplayListRecordingContext context(display_list_recorder, page().palette(), page().client().device_pixels_per_css_pixel(), page().chrome_metrics());
     context.set_device_viewport_rect(viewport_rect);
     context.set_should_show_line_box_borders(config.should_show_line_box_borders);
     context.set_should_paint_overlay(config.paint_overlay);
-
-    update_paint_and_hit_testing_properties_if_needed();
 
     auto& viewport_paintable = *paintable();
 
@@ -7642,41 +7566,45 @@ String Document::dump_display_list()
 
     HashMap<size_t, Painting::PaintableBox const*> context_id_to_paintable;
     viewport_paintable->for_each_in_inclusive_subtree_of_type<Painting::PaintableBox>([&](auto const& paintable_box) {
-        if (auto context = paintable_box.accumulated_visual_context())
-            (void)context_id_to_paintable.try_set(context->id(), &paintable_box);
+        auto visual_context_index = paintable_box.accumulated_visual_context_index();
+        if (visual_context_index.value())
+            (void)context_id_to_paintable.try_set(visual_context_index.value(), &paintable_box);
         return TraversalDecision::Continue;
     });
 
-    HashTable<Painting::AccumulatedVisualContext const*> visited;
-    HashMap<Painting::AccumulatedVisualContext const*, Vector<Painting::AccumulatedVisualContext const*>> children;
-    Vector<Painting::AccumulatedVisualContext const*> root_contexts;
+    StringBuilder builder;
+    builder.append("AccumulatedVisualContext Tree:\n"sv);
+
+    auto const& visual_context_tree = display_list->visual_context_tree();
+    HashTable<size_t> visited;
+    HashMap<size_t, Vector<size_t>> children;
+    Vector<size_t> root_contexts;
 
     for (auto const& item : display_list->commands()) {
-        if (!item.context)
+        if (!item.context_index.value())
             continue;
-        for (auto const* node = item.context.ptr(); node && !visited.contains(node); node = node->parent().ptr()) {
-            visited.set(node);
-            if (auto const* parent = node->parent().ptr())
-                children.ensure(parent).append(node);
-            else if (!root_contexts.contains_slow(node))
-                root_contexts.append(node);
+        for (size_t node_index = item.context_index.value(); node_index && !visited.contains(node_index); node_index = visual_context_tree.node_at(Painting::VisualContextIndex(node_index)).parent_index.value()) {
+            visited.set(node_index);
+            auto parent = visual_context_tree.node_at(Painting::VisualContextIndex(node_index)).parent_index.value();
+            if (parent)
+                children.ensure(parent).append(node_index);
+            else if (!root_contexts.contains_slow(node_index))
+                root_contexts.append(node_index);
         }
     }
 
-    StringBuilder builder;
-    builder.append("AccumulatedVisualContext Tree:\n"sv);
-    Function<void(Painting::AccumulatedVisualContext const*, size_t)> dump_context = [&](auto const* node, size_t indent) {
+    Function<void(size_t, size_t)> dump_context = [&](size_t node_index, size_t indent) {
         builder.append_repeated(' ', indent * 2);
-        builder.appendff("[{}] ", node->id());
-        node->dump(builder);
-        if (auto it = context_id_to_paintable.find(node->id()); it != context_id_to_paintable.end())
+        builder.appendff("[{}] ", node_index);
+        visual_context_tree.dump(Painting::VisualContextIndex(node_index), builder);
+        if (auto it = context_id_to_paintable.find(node_index); it != context_id_to_paintable.end())
             builder.appendff(" ({})", it->value->debug_description());
         builder.append('\n');
-        for (auto const* child : children.get(node).value_or({}))
-            dump_context(child, indent + 1);
+        for (auto child_node_index : children.get(node_index).value_or({}))
+            dump_context(child_node_index, indent + 1);
     };
 
-    for (auto const* root : root_contexts)
+    for (auto root : root_contexts)
         dump_context(root, 1);
 
     builder.append("\nDisplayList:\n"sv);
@@ -7696,7 +7624,7 @@ String Document::dump_display_list()
 
                 builder.append_repeated(' ', indent * 2);
                 item.command.visit([&](auto const& command) {
-                    builder.appendff("{}@{}", command.command_name, item.context ? item.context->id() : 0);
+                    builder.appendff("{}@{}", command.command_name, item.context_index.value());
                     command.dump(builder);
                 });
                 builder.append('\n');
@@ -8185,6 +8113,22 @@ void Document::remove_pending_css_import_rule(Badge<CSS::CSSImportRule>, GC::Ref
 void Document::exit_pointer_lock()
 {
     dbgln("FIXME: exit_pointer_lock()");
+}
+
+Optional<CSS::SelectorList> const* Document::cached_query_selector_result(String const& selector_text) const
+{
+    auto it = m_selector_query_cache.find(selector_text);
+    if (it == m_selector_query_cache.end())
+        return nullptr;
+    return &it->value;
+}
+
+void Document::cache_query_selector_result(String selector_text, Optional<CSS::SelectorList> result)
+{
+    if (m_selector_query_cache.size() >= max_selector_query_cache_size)
+        m_selector_query_cache.remove(m_selector_query_cache.begin());
+
+    m_selector_query_cache.set(move(selector_text), move(result));
 }
 
 }

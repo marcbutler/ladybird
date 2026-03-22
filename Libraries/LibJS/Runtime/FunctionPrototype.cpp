@@ -77,13 +77,11 @@ JS_DEFINE_NATIVE_FUNCTION(FunctionPrototype::apply)
     // OPTIMIZATION: If argArray has a simple indexed storage without holes and doesn't interfere with indexed property access,
     //               we can skip CreateListFromArrayLike and directly use the storage elements.
     auto& arg_array_object = arg_array.as_object();
-    auto* storage = arg_array_object.indexed_properties().storage();
-    if (!arg_array_object.may_interfere_with_indexed_property_access() && storage && storage->is_simple_storage()) {
+    if (!arg_array_object.may_interfere_with_indexed_property_access() && arg_array_object.indexed_storage_kind() == IndexedStorageKind::Packed) {
         auto length = TRY(length_of_array_like(vm, arg_array_object));
-        auto const* simple_storage = static_cast<SimpleIndexedPropertyStorage*>(storage);
-        auto storage_elements = simple_storage->elements().span();
-        if (!simple_storage->has_empty_elements() && storage_elements.size() >= length)
-            return TRY(JS::call(vm, function, this_arg, storage_elements.slice(0, length)));
+        auto span = arg_array_object.indexed_packed_elements_span();
+        if (span.size() >= length)
+            return TRY(JS::call(vm, function, this_arg, span.slice(0, length)));
     }
 
     // 4. Let argList be ? CreateListFromArrayLike(argArray).
@@ -114,7 +112,7 @@ JS_DEFINE_NATIVE_FUNCTION(FunctionPrototype::bind)
 
     Vector<Value> arguments;
     if (vm.argument_count() > 1) {
-        arguments.append(vm.running_execution_context().arguments.slice(1).data(), vm.argument_count() - 1);
+        arguments.append(vm.running_execution_context().arguments_span().slice(1).data(), vm.argument_count() - 1);
     }
 
     // 3. Let F be ? BoundFunctionCreate(Target, thisArg, args).
@@ -145,7 +143,7 @@ JS_DEFINE_NATIVE_FUNCTION(FunctionPrototype::call)
     // FIXME: 3. Perform PrepareForTailCall().
 
     auto this_arg = vm.argument(0);
-    auto args = vm.argument_count() > 1 ? vm.running_execution_context().arguments.slice(1) : ReadonlySpan<Value> {};
+    auto args = vm.argument_count() > 1 ? vm.running_execution_context().arguments_span().slice(1) : ReadonlySpan<Value> {};
 
     // 4. Return ? Call(func, thisArg, args).
     return TRY(JS::call(vm, function, this_arg, args));

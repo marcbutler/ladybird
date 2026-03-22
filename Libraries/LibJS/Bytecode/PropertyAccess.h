@@ -8,6 +8,7 @@
 
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Bytecode/IdentifierTable.h>
+#include <LibJS/Bytecode/PutKind.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Accessor.h>
 #include <LibJS/Runtime/Completion.h>
@@ -82,7 +83,7 @@ ALWAYS_INLINE ThrowCompletionOr<Value> get_by_id(VM& vm, GetBaseIdentifier get_b
     if constexpr (mode == GetByIdMode::Length) {
         // OPTIMIZATION: Fast path for the magical "length" property on Array objects.
         if (base_obj->has_magical_length_property()) {
-            return Value { base_obj->indexed_properties().array_like_size() };
+            return Value { base_obj->indexed_array_like_size() };
         }
     }
 

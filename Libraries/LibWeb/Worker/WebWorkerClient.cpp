@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibCore/System.h>
 #include <LibWeb/Worker/WebWorkerClient.h>
 
 namespace Web::HTML {
@@ -37,17 +36,12 @@ Messages::WebWorkerClient::RequestWorkerAgentResponse WebWorkerClient::request_w
 {
     if (on_request_worker_agent)
         return on_request_worker_agent(worker_type);
-    return IPC::File {};
+    return { IPC::TransportHandle {}, IPC::TransportHandle {}, IPC::TransportHandle {} };
 }
 
 WebWorkerClient::WebWorkerClient(NonnullOwnPtr<IPC::Transport> transport)
     : IPC::ConnectionToServer<WebWorkerClientEndpoint, WebWorkerServerEndpoint>(*this, move(transport))
 {
-}
-
-IPC::File WebWorkerClient::clone_transport()
-{
-    return MUST(m_transport->clone_for_transfer());
 }
 
 }

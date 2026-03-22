@@ -195,6 +195,10 @@ pub(crate) struct ParserFlags {
     pub string_legacy_octal_escape_sequence_in_scope: bool,
     pub in_class_field_initializer: bool,
     pub in_class_static_init_block: bool,
+    /// True inside non-arrow function bodies and class static init blocks.
+    /// Arrow functions inherit this flag rather than setting it, since they
+    /// don't have their own `new.target` binding.
+    pub new_target_is_valid: bool,
     pub function_might_need_arguments_object: bool,
     pub previous_token_was_period: bool,
     /// Set during property key parsing to suppress eval/arguments check.
@@ -250,6 +254,10 @@ pub struct Parser<'a> {
     /// through nested labels (e.g., `a: b: for(...)`).
     last_inner_label_is_iteration: bool,
 
+    /// Set by parse_primary_expression when it parses a parenthesized expression.
+    /// Consumed by parse_secondary_expression to prevent treating (obj) as destructuring.
+    pub(crate) last_primary_was_parenthesized: bool,
+
     last_function_name: Utf16String,
     last_function_kind: FunctionKind,
     last_class_name: Utf16String,
@@ -287,6 +295,7 @@ pub struct Parser<'a> {
     pub(crate) for_loop_declaration_count: usize,
     pub(crate) for_loop_declaration_has_init: bool,
     pub(crate) for_loop_declaration_is_var: bool,
+    pub(crate) for_loop_declaration_is_pattern: bool,
 
     pub scope_collector: ScopeCollector,
 
@@ -333,6 +342,7 @@ impl<'a> Parser<'a> {
             in_eval_function_context: false,
             labels_in_scope: HashMap::new(),
             last_inner_label_is_iteration: false,
+            last_primary_was_parenthesized: false,
             last_function_name: Utf16String::default(),
             last_function_kind: FunctionKind::Normal,
             last_class_name: Utf16String::default(),
@@ -346,6 +356,7 @@ impl<'a> Parser<'a> {
             for_loop_declaration_count: 0,
             for_loop_declaration_has_init: false,
             for_loop_declaration_is_var: false,
+            for_loop_declaration_is_pattern: false,
             scope_collector: ScopeCollector::new(),
             exported_names: HashSet::new(),
             function_table: FunctionTable::new(),
@@ -483,8 +494,7 @@ impl<'a> Parser<'a> {
             if is_strict_reserved_word(value) {
                 let name = String::from_utf16_lossy(value);
                 self.syntax_error(&format!(
-                    "Identifier must not be a reserved word in strict mode ('{}')",
-                    name
+                    "Identifier must not be a reserved word in strict mode ('{name}')"
                 ));
             }
         }
@@ -651,8 +661,7 @@ impl<'a> Parser<'a> {
         if !self.register_referenced_private_name(&value) {
             let name = String::from_utf16_lossy(&value);
             self.syntax_error(&format!(
-                "Reference to undeclared private field or method '{}'",
-                name
+                "Reference to undeclared private field or method '{name}'"
             ));
         }
         let token = self.consume();
@@ -846,10 +855,16 @@ impl<'a> Parser<'a> {
             } else if is_strict_reserved_word(name) {
                 let name_str = String::from_utf16_lossy(name);
                 self.syntax_error(&format!(
-                    "Identifier must not be a reserved word in strict mode ('{}')",
-                    name_str
+                    "Identifier must not be a reserved word in strict mode ('{name_str}')"
                 ));
             }
+        }
+        // 'await' is not allowed as a binding identifier in class static
+        // init blocks or module code.
+        if name == utf16!("await")
+            && (self.flags.in_class_static_init_block || self.program_type == ProgramType::Module)
+        {
+            self.syntax_error("'await' is not allowed as an identifier in this context");
         }
     }
 
@@ -865,8 +880,7 @@ impl<'a> Parser<'a> {
             if !seen_names.insert(&**name) {
                 let name_str = String::from_utf16_lossy(name);
                 self.syntax_error(&format!(
-                    "Duplicate parameter '{}' not allowed in arrow function",
-                    name_str
+                    "Duplicate parameter '{name_str}' not allowed in arrow function"
                 ));
             }
         }
@@ -890,8 +904,7 @@ impl<'a> Parser<'a> {
             if !seen_names.insert(&**name) {
                 let name_str = String::from_utf16_lossy(name);
                 self.syntax_error(&format!(
-                    "Duplicate parameter '{}' not allowed in strict mode",
-                    name_str
+                    "Duplicate parameter '{name_str}' not allowed in strict mode"
                 ));
             }
         }
@@ -924,7 +937,7 @@ impl<'a> Parser<'a> {
 
     /// Re-parse the source range starting at `start` as a binding pattern
     /// with member expressions allowed (for destructuring assignment patterns).
-    pub(crate) fn synthesize_binding_pattern(&mut self, start: Position) -> Option<BindingPattern> {
+    pub(crate) fn synthesize_binding_pattern(&mut self, start: Position) -> BindingPattern {
         // Clear any syntax errors that occurred in the range of the expression
         // being reinterpreted as a binding pattern. This matches C++'s behavior
         // where errors like duplicate __proto__ in object literals are cleared
@@ -952,17 +965,23 @@ impl<'a> Parser<'a> {
         self.current_token = saved_token;
         self.allow_member_expressions = saved_allow;
 
-        Some(pattern)
+        pattern
     }
 
+    // https://tc39.es/ecma262/#sec-static-semantics-assignmenttargettype
     pub(crate) fn is_simple_assignment_target(
         expression: &Expression,
         allow_call_expression: bool,
+        strict_mode: bool,
     ) -> bool {
-        matches!(
-            &expression.inner,
-            ExpressionKind::Identifier(_) | ExpressionKind::Member { .. }
-        ) || (allow_call_expression && matches!(&expression.inner, ExpressionKind::Call(_)))
+        match &expression.inner {
+            ExpressionKind::Identifier(_) | ExpressionKind::Member { .. } => true,
+            // CallExpression: In strict mode, call expressions are always ~invalid~ as
+            // assignment targets. In non-strict mode, they are ~web-compat~ (runtime error).
+            // NewExpression is always ~invalid~.
+            ExpressionKind::Call(_) if allow_call_expression && !strict_mode => true,
+            _ => false,
+        }
     }
 
     fn is_object_expression(expression: &Expression) -> bool {
@@ -979,10 +998,6 @@ impl<'a> Parser<'a> {
 
     fn is_member_expression(expression: &Expression) -> bool {
         matches!(&expression.inner, ExpressionKind::Member { .. })
-    }
-
-    fn is_call_expression(expression: &Expression) -> bool {
-        matches!(&expression.inner, ExpressionKind::Call(_))
     }
 
     fn is_update_expression(expression: &Expression) -> bool {

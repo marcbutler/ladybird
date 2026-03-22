@@ -145,28 +145,6 @@ bool Navigable::is_ancestor_of(GC::Ref<Navigable> other) const
     return false;
 }
 
-static RefPtr<Gfx::SkiaBackendContext> g_cached_skia_backend_context;
-
-static RefPtr<Gfx::SkiaBackendContext> get_skia_backend_context()
-{
-    if (!g_cached_skia_backend_context) {
-#ifdef AK_OS_MACOS
-        auto metal_context = Gfx::get_metal_context();
-        g_cached_skia_backend_context = Gfx::SkiaBackendContext::create_metal_context(*metal_context);
-#elif USE_VULKAN
-        auto maybe_vulkan_context = Gfx::create_vulkan_context();
-        if (maybe_vulkan_context.is_error()) {
-            dbgln("Vulkan context creation failed: {}", maybe_vulkan_context.error());
-            return {};
-        }
-
-        auto vulkan_context = maybe_vulkan_context.release_value();
-        g_cached_skia_backend_context = Gfx::SkiaBackendContext::create_vulkan_context(vulkan_context);
-#endif
-    }
-    return g_cached_skia_backend_context;
-}
-
 Navigable::Navigable(GC::Ref<Page> page, bool is_svg_page)
     : m_page(page)
     , m_event_handler({}, *this)
@@ -179,19 +157,9 @@ Navigable::Navigable(GC::Ref<Page> page, bool is_svg_page)
 {
     all_navigables().set(*this);
 
-    auto display_list_player_type = page->client().display_list_player_type();
-    if (display_list_player_type == DisplayListPlayerType::SkiaGPUIfAvailable) {
-        m_skia_backend_context = get_skia_backend_context();
-    }
-
     if (!m_is_svg_page) {
-        OwnPtr<Painting::DisplayListPlayerSkia> skia_player;
-        if (display_list_player_type == DisplayListPlayerType::SkiaGPUIfAvailable) {
-            skia_player = make<Painting::DisplayListPlayerSkia>(m_skia_backend_context);
-        } else {
-            skia_player = make<Painting::DisplayListPlayerSkia>();
-        }
-        m_rendering_thread.set_skia_player(move(skia_player));
+        auto display_list_player_type = page->client().display_list_player_type();
+        m_rendering_thread.set_skia_player(make<Painting::DisplayListPlayerSkia>());
         m_rendering_thread.start(display_list_player_type);
     }
 }
@@ -1423,10 +1391,6 @@ void Navigable::populate_session_history_entry_document(
 
         // 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run these steps:
         queue_global_task(Task::Source::NavigationAndTraversal, *active_window(), GC::create_function(heap(), [this, entry, received_navigation_params = move(received_navigation_params), navigation_id, user_involvement, completion_steps, csp_navigation_type, signal_to_continue_session_history_processing]() mutable {
-            // NOTE: This check is not in the spec but we should not continue navigation if navigable has been destroyed.
-            if (has_been_destroyed())
-                return;
-
             // 1. If navigable's ongoing navigation no longer equals navigationId, then run completionSteps and abort these steps.
             if (navigation_id.has_value() && ongoing_navigation() != navigation_id) {
                 if (completion_steps) {
@@ -1903,7 +1867,6 @@ void Navigable::begin_navigation(NavigateParams params)
 
         // 3. Queue a global task on the navigation and traversal task source given navigable's active window to abort a document and its descendants given navigable's active document.
         queue_global_task(Task::Source::NavigationAndTraversal, *active_window(), GC::create_function(heap(), [this] {
-            VERIFY(this->active_document());
             this->active_document()->abort_a_document_and_its_descendants();
         }));
 
@@ -2586,13 +2549,11 @@ CSSPixelPoint Navigable::to_top_level_position(CSSPixelPoint a_position)
         if (!paintable)
             return {};
 
-        if (auto const* paintable_box = as_if<Painting::PaintableBox>(*paintable); paintable_box && paintable_box->accumulated_visual_context()) {
-            auto const& accumulated_visual_context = *paintable_box->accumulated_visual_context();
-            auto const& viewport_paintable = *paintable_box->document().paintable();
-            auto const& scroll_state = viewport_paintable.scroll_state_snapshot();
+        if (auto const* paintable_box = as_if<Painting::PaintableBox>(*paintable);
+            paintable_box && paintable_box->accumulated_visual_context_index().value()) {
             auto point = paintable_box->absolute_position();
             point.translate_by(position);
-            position = accumulated_visual_context.transform_rect_to_viewport({ point, { 0, 0 } }, scroll_state).location().to_type<CSSPixels>();
+            position = paintable_box->transform_rect_to_viewport({ point, { 0, 0 } }).location();
         } else {
             position.translate_by(paintable->box_type_agnostic_position());
         }
@@ -2711,10 +2672,13 @@ void Navigable::inform_the_navigation_api_about_aborting_navigation()
         return;
 
     queue_global_task(Task::Source::NavigationAndTraversal, *active_window(), GC::create_function(heap(), [this] {
+        // AD-HOC: The active window may have become null between when this task was queued and when it runs.
+        if (!active_window())
+            return;
+
         HTML::TemporaryExecutionContext execution_context { active_window()->realm() };
 
         // 2. Let navigation be navigable's active window's navigation API.
-        VERIFY(active_window());
         auto navigation = active_window()->navigation();
 
         // 3. If navigation's ongoing navigate event is null, then return.
@@ -2911,11 +2875,6 @@ void Navigable::render_screenshot(Gfx::PaintingSurface& painting_surface, PaintC
 {
     record_display_list_and_scroll_state(paint_config);
     m_rendering_thread.request_screenshot(painting_surface, move(callback));
-}
-
-RefPtr<Gfx::SkiaBackendContext> Navigable::skia_backend_context() const
-{
-    return m_skia_backend_context;
 }
 
 GC::Ref<WebIDL::Promise> Navigable::scroll_viewport_by_delta(CSSPixelPoint delta)

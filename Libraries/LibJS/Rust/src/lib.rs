@@ -188,13 +188,15 @@ unsafe fn source_from_raw<'a>(source: *const u16, len: usize) -> Option<&'a [u16
 }
 
 /// Callback type for reporting parse errors to C++.
-type ParseErrorCallback = unsafe extern "C" fn(
-    ctx: *mut c_void,
-    message: *const u8,
-    message_len: usize,
-    line: u32,
-    column: u32,
-);
+pub type ParseErrorCallback = Option<
+    unsafe extern "C" fn(
+        ctx: *mut c_void,
+        message: *const u8,
+        message_len: usize,
+        line: u32,
+        column: u32,
+    ) -> (),
+>;
 
 /// Log parser and scope collector errors, returning true if any were found.
 fn check_errors(parser: &mut Parser) -> bool {
@@ -205,7 +207,7 @@ fn check_errors(parser: &mut Parser) -> bool {
 fn check_errors_with_callback(
     parser: &mut Parser,
     error_context: *mut c_void,
-    error_callback: Option<ParseErrorCallback>,
+    error_callback: ParseErrorCallback,
 ) -> bool {
     if parser.has_errors() {
         if let Some(cb) = error_callback {
@@ -492,7 +494,7 @@ pub unsafe extern "C" fn rust_parsed_program_has_errors(parsed: *const ParsedPro
 /// Report parse errors from a ParsedProgram via callback, then clear them.
 ///
 /// Calls `error_callback` for each error with the same signature as
-/// `RustParseErrorCallback`.
+/// `ParseErrorCallback`.
 ///
 /// # Safety
 /// - `parsed` must be a valid pointer from `rust_parse_program()`.
@@ -507,7 +509,7 @@ pub unsafe extern "C" fn rust_parsed_program_take_errors(
         let parsed = &mut *parsed;
         for err in parsed.errors.drain(..) {
             let msg = err.message.as_bytes();
-            error_callback(error_context, msg.as_ptr(), msg.len(), err.line, err.column);
+            error_callback.unwrap()(error_context, msg.as_ptr(), msg.len(), err.line, err.column);
         }
     }
 }
@@ -640,7 +642,7 @@ pub unsafe extern "C" fn rust_compile_script(
     dump_ast: bool,
     use_color: bool,
     error_context: *mut c_void,
-    error_callback: Option<ParseErrorCallback>,
+    error_callback: ParseErrorCallback,
     ast_dump_output: *mut *mut u8,
     ast_dump_output_len: *mut usize,
     initial_line_number: usize,
@@ -665,7 +667,7 @@ pub unsafe extern "C" fn rust_compile_script(
 
             if rust_parsed_program_has_errors(parsed) {
                 if let Some(cb) = error_callback {
-                    rust_parsed_program_take_errors(parsed, error_context, cb);
+                    rust_parsed_program_take_errors(parsed, error_context, Some(cb));
                 }
                 rust_free_parsed_program(parsed);
                 return std::ptr::null_mut();
@@ -712,7 +714,7 @@ pub unsafe extern "C" fn rust_compile_eval(
     allow_super_constructor_call: bool,
     in_class_field_initializer: bool,
     error_context: *mut c_void,
-    error_callback: Option<ParseErrorCallback>,
+    error_callback: ParseErrorCallback,
     ast_dump_output: *mut *mut u8,
     ast_dump_output_len: *mut usize,
 ) -> *mut c_void {
@@ -818,7 +820,7 @@ pub unsafe extern "C" fn rust_compile_dynamic_function(
     source_code_ptr: *const c_void,
     function_kind: u8,
     error_context: *mut c_void,
-    error_callback: Option<ParseErrorCallback>,
+    error_callback: ParseErrorCallback,
     ast_dump_output: *mut *mut u8,
     ast_dump_output_len: *mut usize,
 ) -> *mut c_void {
@@ -870,16 +872,16 @@ pub unsafe extern "C" fn rust_compile_dynamic_function(
                 let mut validate_src: Vec<u16> = Vec::new();
                 match kind {
                     ast::FunctionKind::Generator => {
-                        validate_src.extend_from_slice(utf16!("function* test("))
+                        validate_src.extend_from_slice(utf16!("function* test("));
                     }
                     ast::FunctionKind::Async => {
-                        validate_src.extend_from_slice(utf16!("async function test("))
+                        validate_src.extend_from_slice(utf16!("async function test("));
                     }
                     ast::FunctionKind::AsyncGenerator => {
-                        validate_src.extend_from_slice(utf16!("async function* test("))
+                        validate_src.extend_from_slice(utf16!("async function* test("));
                     }
                     ast::FunctionKind::Normal => {
-                        validate_src.extend_from_slice(utf16!("function test("))
+                        validate_src.extend_from_slice(utf16!("function test("));
                     }
                 }
                 validate_src.extend_from_slice(parameters_slice);
@@ -902,6 +904,7 @@ pub unsafe extern "C" fn rust_compile_dynamic_function(
                 };
                 let mut parser = Parser::new(body_slice, ProgramType::Script);
                 parser.flags.in_function_context = true;
+                parser.flags.new_target_is_valid = true;
                 match kind {
                     ast::FunctionKind::Async | ast::FunctionKind::AsyncGenerator => {
                         parser.flags.await_expression_is_valid = true;
@@ -1292,8 +1295,8 @@ unsafe fn call_export_callback(
     callback: ModuleExportEntryCallback,
     ctx: *mut c_void,
     kind: u8,
-    export_name: &Option<ast::Utf16String>,
-    local_or_import_name: &Option<ast::Utf16String>,
+    export_name: Option<&ast::Utf16String>,
+    local_or_import_name: Option<&ast::Utf16String>,
     module_request: Option<&ast::ModuleRequest>,
 ) {
     unsafe {
@@ -1362,7 +1365,7 @@ pub unsafe extern "C" fn rust_compile_module(
     dump_ast: bool,
     use_color: bool,
     error_context: *mut c_void,
-    error_callback: Option<ParseErrorCallback>,
+    error_callback: ParseErrorCallback,
     tla_executable_out: *mut *mut c_void,
     ast_dump_output: *mut *mut u8,
     ast_dump_output_len: *mut usize,
@@ -1380,7 +1383,7 @@ pub unsafe extern "C" fn rust_compile_module(
 
             if rust_parsed_program_has_errors(parsed) {
                 if let Some(cb) = error_callback {
-                    rust_parsed_program_take_errors(parsed, error_context, cb);
+                    rust_parsed_program_take_errors(parsed, error_context, Some(cb));
                 }
                 rust_free_parsed_program(parsed);
                 return std::ptr::null_mut();
@@ -1456,9 +1459,7 @@ unsafe fn extract_module_metadata(scope: &ast::ScopeData, ctx: *mut c_void, cb: 
 
         // Process export entries (matching SourceTextModule::parse steps 9-10).
         for child in &scope.children {
-            let export_data = if let StatementKind::Export(ref data) = child.inner {
-                data
-            } else {
+            let StatementKind::Export(ref export_data) = child.inner else {
                 continue;
             };
 
@@ -1499,8 +1500,8 @@ unsafe fn extract_module_metadata(scope: &ast::ScopeData, ctx: *mut c_void, cb: 
                                 cb.push_local_export,
                                 ctx,
                                 entry.kind as u8,
-                                &entry.export_name,
-                                &entry.local_or_import_name,
+                                entry.export_name.as_ref(),
+                                entry.local_or_import_name.as_ref(),
                                 None,
                             );
                         } else {
@@ -1509,8 +1510,8 @@ unsafe fn extract_module_metadata(scope: &ast::ScopeData, ctx: *mut c_void, cb: 
                                 cb.push_indirect_export,
                                 ctx,
                                 ExportEntryKind::NamedExport as u8,
-                                &entry.export_name,
-                                &import_entry.import_name,
+                                entry.export_name.as_ref(),
+                                import_entry.import_name.as_ref(),
                                 Some(&import_entry.module_request),
                             );
                         }
@@ -1520,8 +1521,8 @@ unsafe fn extract_module_metadata(scope: &ast::ScopeData, ctx: *mut c_void, cb: 
                             cb.push_local_export,
                             ctx,
                             entry.kind as u8,
-                            &entry.export_name,
-                            &entry.local_or_import_name,
+                            entry.export_name.as_ref(),
+                            entry.local_or_import_name.as_ref(),
                             None,
                         );
                     }
@@ -1531,8 +1532,8 @@ unsafe fn extract_module_metadata(scope: &ast::ScopeData, ctx: *mut c_void, cb: 
                         cb.push_star_export,
                         ctx,
                         entry.kind as u8,
-                        &entry.export_name,
-                        &entry.local_or_import_name,
+                        entry.export_name.as_ref(),
+                        entry.local_or_import_name.as_ref(),
                         export_data.module_request.as_ref(),
                     );
                 } else {
@@ -1541,8 +1542,8 @@ unsafe fn extract_module_metadata(scope: &ast::ScopeData, ctx: *mut c_void, cb: 
                         cb.push_indirect_export,
                         ctx,
                         entry.kind as u8,
-                        &entry.export_name,
-                        &entry.local_or_import_name,
+                        entry.export_name.as_ref(),
+                        entry.local_or_import_name.as_ref(),
                         export_data.module_request.as_ref(),
                     );
                 }
@@ -1994,7 +1995,7 @@ unsafe fn extract_eval_gdi(
             &mut |name| eval_gdi_push_var_scoped_name(ctx, name.as_ptr(), name.len()),
             &mut |name| eval_gdi_push_annex_b_name(ctx, name.as_ptr(), name.len()),
             &mut |name, is_const| {
-                eval_gdi_push_lexical_binding(ctx, name.as_ptr(), name.len(), is_const)
+                eval_gdi_push_lexical_binding(ctx, name.as_ptr(), name.len(), is_const);
             },
             function_table,
         );
@@ -2057,7 +2058,7 @@ unsafe fn extract_script_gdi(
             &mut |name| script_gdi_push_var_scoped_name(ctx, name.as_ptr(), name.len()),
             &mut |name| script_gdi_push_annex_b_name(ctx, name.as_ptr(), name.len()),
             &mut |name, is_const| {
-                script_gdi_push_lexical_binding(ctx, name.as_ptr(), name.len(), is_const)
+                script_gdi_push_lexical_binding(ctx, name.as_ptr(), name.len(), is_const);
             },
             function_table,
         );
@@ -2645,4 +2646,54 @@ unsafe extern "C" {
         might_need_arguments_object: bool,
         contains_direct_call_to_eval: bool,
     );
+}
+
+/// C-compatible token info for the tokenize callback.
+#[repr(C)]
+pub struct FFIToken {
+    pub token_type: u8,
+    pub category: u8,
+    pub offset: u32,
+    pub length: u32,
+    pub trivia_offset: u32,
+    pub trivia_length: u32,
+}
+
+/// Tokenize a UTF-16 source string, calling `callback` for each token.
+///
+/// # Safety
+/// - `source` must point to a valid UTF-16 buffer of `source_len` elements.
+/// - `callback` must be a valid function pointer.
+/// - `ctx` is passed through to the callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_tokenize(
+    source: *const u16,
+    source_len: usize,
+    ctx: *mut c_void,
+    callback: unsafe extern "C" fn(ctx: *mut c_void, token: *const FFIToken),
+) {
+    unsafe {
+        abort_on_panic(|| {
+            let Some(source_slice) = source_from_raw(source, source_len) else {
+                return;
+            };
+            let mut lex = lexer::Lexer::new(source_slice, 1, 0);
+            loop {
+                let tok = lex.next();
+                let is_eof = tok.token_type == token::TokenType::Eof;
+                let ffi_tok = FFIToken {
+                    token_type: tok.token_type as u8,
+                    category: tok.token_type.category() as u8,
+                    offset: tok.value_start,
+                    length: tok.value_len,
+                    trivia_offset: tok.trivia_start,
+                    trivia_length: tok.trivia_len,
+                };
+                callback(ctx, &raw const ffi_tok);
+                if is_eof {
+                    break;
+                }
+            }
+        });
+    }
 }

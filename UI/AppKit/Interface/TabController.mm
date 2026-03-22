@@ -46,6 +46,16 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
     return result;
 }
 
+// NSSearchField does not provide an intrinsic width, which causes an ambiguous layout warning when the toolbar auto-
+// measures this view. This provides an initial fallback, which is overridden with an explicit width in windowDidResize.
+- (NSSize)intrinsicContentSize
+{
+    auto size = [super intrinsicContentSize];
+    if (size.width < 0)
+        size.width = 400;
+    return size;
+}
+
 @end
 
 @interface TabController () <NSToolbarDelegate, NSSearchFieldDelegate, AutocompleteObserver>
@@ -55,6 +65,7 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
     OwnPtr<WebView::Autocomplete> m_autocomplete;
 
     bool m_fullscreen_requested_for_web_content;
+    bool m_fullscreen_exit_was_ui_initiated;
     bool m_fullscreen_should_restore_tab_bar;
 }
 
@@ -108,6 +119,7 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
 
         m_page_index = 0;
         m_fullscreen_requested_for_web_content = false;
+        m_fullscreen_exit_was_ui_initiated = true;
         m_fullscreen_should_restore_tab_bar = false;
 
         self.autocomplete = [[Autocomplete alloc] init:self withToolbarItem:self.location_toolbar_item];
@@ -134,6 +146,7 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
 
         m_page_index = page_index;
         m_fullscreen_requested_for_web_content = false;
+        m_fullscreen_exit_was_ui_initiated = true;
         m_fullscreen_should_restore_tab_bar = false;
     }
 
@@ -174,6 +187,7 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
 - (void)onExitFullscreenWindow
 {
     if (([self.window styleMask] & NSWindowStyleMaskFullScreen) != 0) {
+        m_fullscreen_exit_was_ui_initiated = false;
         [self.window toggleFullScreen:nil];
     }
 }
@@ -489,6 +503,18 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
     }
 }
 
+- (void)windowDidEnterFullScreen:(NSNotification*)notification
+{
+    if (m_fullscreen_requested_for_web_content)
+        [[[self tab] web_view] handleEnteredFullScreen];
+}
+
+- (void)windowWillExitFullScreen:(NSNotification*)notification
+{
+    if (exchange(m_fullscreen_exit_was_ui_initiated, true))
+        [[[self tab] web_view] handleExitFullScreen];
+}
+
 - (void)windowDidExitFullScreen:(NSNotification*)notification
 {
     if (exchange(m_fullscreen_requested_for_web_content, false)) {
@@ -499,7 +525,7 @@ static NSString* const TOOLBAR_TAB_OVERVIEW_IDENTIFIER = @"ToolbarTabOverviewIde
         }
     }
 
-    [[[self tab] web_view] handleExitFullScreen];
+    [[[self tab] web_view] handleExitedFullScreen];
 }
 
 - (NSApplicationPresentationOptions)window:(NSWindow*)window

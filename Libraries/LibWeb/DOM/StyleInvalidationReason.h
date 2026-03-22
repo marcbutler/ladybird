@@ -19,12 +19,11 @@ namespace Web::DOM {
     X(CSSStylePropertiesTextChange)                 \
     X(CustomElementStateChange)                     \
     X(CustomStateSetChange)                         \
-    X(DidLoseFocus)                                 \
-    X(DidReceiveFocus)                              \
     X(EditingInsertion)                             \
     X(EditingDeletion)                              \
     X(ElementAttributeChange)                       \
     X(ElementSetShadowRoot)                         \
+    X(ElementSetActive)                             \
     X(Fullscreen)                                   \
     X(HTMLDialogElementSetIsModal)                  \
     X(HTMLDetailsOrDialogOpenAttributeChange)       \

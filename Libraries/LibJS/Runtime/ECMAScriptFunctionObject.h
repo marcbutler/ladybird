@@ -8,7 +8,6 @@
 
 #pragma once
 
-#include <LibJS/Bytecode/Generator.h>
 #include <LibJS/Bytecode/Interpreter.h>
 #include <LibJS/Export.h>
 #include <LibJS/Runtime/ClassFieldDefinition.h>
@@ -30,10 +29,6 @@ class JS_API ECMAScriptFunctionObject final : public FunctionObject {
     GC_DECLARE_ALLOCATOR(ECMAScriptFunctionObject);
 
 public:
-    static GC::Ref<ECMAScriptFunctionObject> create(Realm&, Utf16FlyString name, Utf16String source_text, Statement const& ecmascript_code, NonnullRefPtr<FunctionParameters const> parameters, i32 function_length, Vector<LocalVariable> local_variables_names, Environment* parent_environment, PrivateEnvironment* private_environment, FunctionKind, bool is_strict, FunctionParsingInsights, bool is_arrow_function = false, Variant<PropertyKey, PrivateName, Empty> class_field_initializer_name = {});
-    static GC::Ref<ECMAScriptFunctionObject> create(Realm&, Utf16FlyString name, Utf16View source_text, Statement const& ecmascript_code, NonnullRefPtr<FunctionParameters const> parameters, i32 function_length, Vector<LocalVariable> local_variables_names, Environment* parent_environment, PrivateEnvironment* private_environment, FunctionKind, bool is_strict, FunctionParsingInsights, bool is_arrow_function = false, Variant<PropertyKey, PrivateName, Empty> class_field_initializer_name = {});
-    static GC::Ref<ECMAScriptFunctionObject> create(Realm&, Utf16FlyString name, Object& prototype, Utf16View source_text, Statement const& ecmascript_code, NonnullRefPtr<FunctionParameters const> parameters, i32 function_length, Vector<LocalVariable> local_variables_names, Environment* parent_environment, PrivateEnvironment* private_environment, FunctionKind, bool is_strict, FunctionParsingInsights, bool is_arrow_function = false, Variant<PropertyKey, PrivateName, Empty> class_field_initializer_name = {});
-
     [[nodiscard]] static GC::Ref<ECMAScriptFunctionObject> create_from_function_data(
         GC::Ref<Realm>,
         GC::Ref<SharedFunctionInstanceData>,
@@ -59,11 +54,6 @@ public:
     [[nodiscard]] bool is_module_wrapper() const { return shared_data().m_is_module_wrapper; }
     void set_is_module_wrapper(bool b) { const_cast<SharedFunctionInstanceData&>(shared_data()).m_is_module_wrapper = b; }
 
-    Statement const& ecmascript_code() const
-    {
-        VERIFY(shared_data().m_ecmascript_code);
-        return *shared_data().m_ecmascript_code;
-    }
     [[nodiscard]] u32 formal_parameter_count() const { return shared_data().m_formal_parameter_count; }
     [[nodiscard]] ReadonlySpan<Utf16FlyString> parameter_names_for_mapped_arguments() const { return shared_data().m_parameter_names_for_mapped_arguments; }
 
@@ -106,7 +96,7 @@ public:
     bool has_simple_parameter_list() const { return shared_data().m_has_simple_parameter_list; }
 
     // Equivalent to absence of [[Construct]]
-    virtual bool has_constructor() const override { return kind() == FunctionKind::Normal && !shared_data().m_is_arrow_function; }
+    virtual bool has_constructor() const override { return kind() == FunctionKind::Normal && !shared_data().m_is_arrow_function && !m_is_method; }
 
     virtual Vector<LocalVariable> const& local_variables_names() const override { return shared_data().m_local_variables_names; }
 
@@ -161,6 +151,7 @@ private:
     mutable OwnPtr<ClassData> m_class_data;
 
     mutable bool m_may_need_lazy_prototype_instantiation { false };
+    bool m_is_method { false };
 };
 
 template<>

@@ -1144,13 +1144,25 @@ void GridFormattingContext::maximize_tracks_using_available_size(AvailableSpace 
 
     // If the free space is positive, distribute it equally to the base sizes of all tracks, freezing
     // tracks as they reach their growth limits (and continuing to grow the unfrozen tracks as needed).
-    while (free_space_px > 0) {
-        auto free_space_to_distribute_per_track = free_space_px / tracks.size();
+    size_t growable_track_count = 0;
+    for (auto& track : tracks) {
+        if (track.base_size_frozen)
+            continue;
+        VERIFY(track.growth_limit.has_value());
+        if (track.base_size < track.growth_limit.value())
+            growable_track_count++;
+    }
+    while (free_space_px > 0 && growable_track_count > 0) {
+        auto free_space_to_distribute_per_track = free_space_px / growable_track_count;
         for (auto& track : tracks) {
             if (track.base_size_frozen)
                 continue;
-            VERIFY(track.growth_limit.has_value());
-            track.base_size = min(track.growth_limit.value(), track.base_size + free_space_to_distribute_per_track);
+            if (track.base_size >= track.growth_limit.value())
+                continue;
+            auto new_base_size = min(track.growth_limit.value(), track.base_size + free_space_to_distribute_per_track);
+            if (new_base_size >= track.growth_limit.value())
+                --growable_track_count;
+            track.base_size = new_base_size;
         }
         if (get_free_space_px() == free_space_px)
             break;
@@ -1704,8 +1716,8 @@ void GridFormattingContext::resolve_grid_item_sizes(GridDimension dimension)
         };
 
         AvailableSpace available_space {
-            AvailableSize::make_definite(containing_block_size_for_item(item, GridDimension::Column)),
-            AvailableSize::make_definite(containing_block_size_for_item(item, GridDimension::Row))
+            AvailableSize::make_definite(clamp_to_max_dimension_value(containing_block_size_for_item(item, GridDimension::Column))),
+            AvailableSize::make_definite(clamp_to_max_dimension_value(containing_block_size_for_item(item, GridDimension::Row)))
         };
 
         auto calculate_inner_size = [this, &item, dimension, available_space](CSS::Size const& size) {
@@ -1748,7 +1760,17 @@ void GridFormattingContext::resolve_grid_item_sizes(GridDimension dimension)
                     .size = stretched_size
                 };
             } else if (preferred_size.is_auto() || preferred_size.is_fit_content()) {
-                auto fit_content_size = dimension == GridDimension::Column ? calculate_fit_content_width(item.box, available_space) : calculate_fit_content_height(item.box, available_space);
+                CSSPixels fit_content_size;
+                if (dimension == GridDimension::Column) {
+                    fit_content_size = calculate_fit_content_width(item.box, available_space);
+                } else if (preferred_size.is_auto() && item.box->has_preferred_aspect_ratio() && *item.box->preferred_aspect_ratio() != 0 && item.used_values.has_definite_width()) {
+                    // NB: When the item has a preferred aspect ratio and a definite width, resolve the
+                    //     height through the aspect ratio instead of using fit-content sizing, which would
+                    //     incorrectly use the available width (grid area width) instead of the item's width.
+                    fit_content_size = item.used_values.content_width() / *item.box->preferred_aspect_ratio();
+                } else {
+                    fit_content_size = calculate_fit_content_height(item.box, available_space);
+                }
                 used_alignment = try_compute_size(fit_content_size, preferred_size);
             } else {
                 auto size_px = calculate_inner_size(preferred_size);
@@ -2443,9 +2465,9 @@ CSSPixels GridFormattingContext::calculate_max_content_contribution(GridItem con
     }
 
     auto resolve_size = [&] {
-        auto available_width = AvailableSize::make_definite(containing_block_size_for_item(item, GridDimension::Column));
+        auto available_width = AvailableSize::make_definite(clamp_to_max_dimension_value(containing_block_size_for_item(item, GridDimension::Column)));
         if (dimension == GridDimension::Row) {
-            auto available_height = AvailableSize::make_definite(containing_block_size_for_item(item, GridDimension::Row));
+            auto available_height = AvailableSize::make_definite(clamp_to_max_dimension_value(containing_block_size_for_item(item, GridDimension::Row)));
             AvailableSpace item_available_space { available_width, available_height };
             return calculate_inner_height(item.box, item_available_space, preferred_size);
         }
@@ -2668,8 +2690,12 @@ CSSPixels GridFormattingContext::calculate_minimum_contribution(GridItem const& 
             return calculate_min_content_contribution(item, dimension);
         if (minimum_size.is_max_content())
             return calculate_max_content_contribution(item, dimension);
-        auto containing_block_size = containing_block_size_for_item(item, dimension);
-        return item.add_margin_box_sizes(minimum_size.to_px(grid_container(), containing_block_size), dimension);
+        CSSPixels inner_minimum_size;
+        if (dimension == GridDimension::Column)
+            inner_minimum_size = calculate_inner_width(item.box, item.available_space().width, minimum_size);
+        else
+            inner_minimum_size = calculate_inner_height(item.box, item.available_space(), minimum_size);
+        return item.add_margin_box_sizes(inner_minimum_size, dimension);
     }
 
     return calculate_min_content_contribution(item, dimension);

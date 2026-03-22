@@ -19,6 +19,7 @@
 #include <LibWeb/Painting/PaintableBox.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
 #include <LibWeb/Painting/StackingContext.h>
+#include <LibWeb/Painting/ViewportPaintable.h>
 
 namespace Web::Painting {
 
@@ -117,21 +118,6 @@ GC::Ptr<HTML::Navigable> Paintable::navigable() const
     return document().navigable();
 }
 
-Paintable::DispatchEventOfSameName Paintable::handle_mousedown(Badge<EventHandler>, CSSPixelPoint, unsigned, unsigned)
-{
-    return DispatchEventOfSameName::Yes;
-}
-
-Paintable::DispatchEventOfSameName Paintable::handle_mouseup(Badge<EventHandler>, CSSPixelPoint, unsigned, unsigned)
-{
-    return DispatchEventOfSameName::Yes;
-}
-
-Paintable::DispatchEventOfSameName Paintable::handle_mousemove(Badge<EventHandler>, CSSPixelPoint, unsigned, unsigned)
-{
-    return DispatchEventOfSameName::Yes;
-}
-
 bool Paintable::handle_mousewheel(Badge<EventHandler>, CSSPixelPoint, unsigned, unsigned, int, int)
 {
     return false;
@@ -164,30 +150,35 @@ StackingContext* Paintable::enclosing_stacking_context()
 void Paintable::paint_inspector_overlay(DisplayListRecordingContext& context) const
 {
     auto& display_list_recorder = context.display_list_recorder();
-    auto const* paintable_box = is<PaintableBox>(this) ? as<PaintableBox>(this) : this->first_ancestor_of_type<PaintableBox>();
+    auto const* paintable_box = as_if<PaintableBox>(this);
+    if (!paintable_box)
+        paintable_box = first_ancestor_of_type<PaintableBox>();
 
     if (paintable_box) {
-        Vector<RefPtr<AccumulatedVisualContext const>> relevant_contexts;
-        for (auto visual_context = paintable_box->accumulated_visual_context(); visual_context != nullptr; visual_context = visual_context->parent()) {
-            auto should_keep_entry = visual_context->data().visit(
-                [](ScrollData const&) -> bool { return true; },
-                [](ClipData const&) -> bool { return false; },
-                [](TransformData const&) -> bool { return true; },
-                [](PerspectiveData const&) -> bool { return true; },
-                [](ClipPathData const&) -> bool { return false; },
-                [](EffectsData const&) -> bool { return false; });
+        auto* visual_context_tree = const_cast<ViewportPaintable*>(document().paintable())->visual_context_tree();
+        auto visual_context_index = paintable_box->accumulated_visual_context_index();
 
-            if (should_keep_entry)
-                relevant_contexts.append(visual_context);
+        if (visual_context_tree && visual_context_index.value()) {
+            Vector<VisualContextIndex> relevant_indices;
+            for (auto i = visual_context_index; i.value(); i = visual_context_tree->node_at(i).parent_index) {
+                auto should_keep = visual_context_tree->node_at(i).data.visit(
+                    [](ScrollData const&) { return true; },
+                    [](ClipData const&) { return false; },
+                    [](TransformData const&) { return true; },
+                    [](PerspectiveData const&) { return true; },
+                    [](ClipPathData const&) { return false; },
+                    [](EffectsData const&) { return false; });
+                if (should_keep)
+                    relevant_indices.append(i);
+            }
+
+            VisualContextIndex overlay_visual_context_index {};
+            for (auto const& source_visual_context_index : relevant_indices.in_reverse())
+                overlay_visual_context_index = visual_context_tree->append(visual_context_tree->node_at(source_visual_context_index).data, overlay_visual_context_index);
+
+            if (overlay_visual_context_index.value())
+                display_list_recorder.set_accumulated_visual_context(overlay_visual_context_index);
         }
-
-        auto visual_context_id = 1;
-        RefPtr<AccumulatedVisualContext> copied_visual_context;
-        for (auto const& original_visual_context : relevant_contexts.in_reverse())
-            copied_visual_context = AccumulatedVisualContext::create(visual_context_id++, original_visual_context->data(), copied_visual_context);
-
-        if (copied_visual_context)
-            display_list_recorder.set_accumulated_visual_context(copied_visual_context);
     }
 
     paint_inspector_overlay_internal(context);
@@ -221,15 +212,15 @@ CSSPixelPoint Paintable::box_type_agnostic_position() const
     return position;
 }
 
-Painting::BorderRadiiData normalize_border_radii_data(Layout::Node const& node, CSSPixelRect const& rect, CSS::BorderRadiusData const& top_left_radius, CSS::BorderRadiusData const& top_right_radius, CSS::BorderRadiusData const& bottom_right_radius, CSS::BorderRadiusData const& bottom_left_radius)
+Painting::BorderRadiiData normalize_border_radii_data(Layout::Node const& node, CSSPixelRect const& border_rect, CSSPixelRect const& reference_rect, CSS::BorderRadiusData const& top_left_radius, CSS::BorderRadiusData const& top_right_radius, CSS::BorderRadiusData const& bottom_right_radius, CSS::BorderRadiusData const& bottom_left_radius)
 {
     Painting::BorderRadiiData radii_px {
         .top_left = {
-            top_left_radius.horizontal_radius.to_px(node, rect.width()),
-            top_left_radius.vertical_radius.to_px(node, rect.height()) },
-        .top_right = { top_right_radius.horizontal_radius.to_px(node, rect.width()), top_right_radius.vertical_radius.to_px(node, rect.height()) },
-        .bottom_right = { bottom_right_radius.horizontal_radius.to_px(node, rect.width()), bottom_right_radius.vertical_radius.to_px(node, rect.height()) },
-        .bottom_left = { bottom_left_radius.horizontal_radius.to_px(node, rect.width()), bottom_left_radius.vertical_radius.to_px(node, rect.height()) }
+            top_left_radius.horizontal_radius.to_px(node, reference_rect.width()),
+            top_left_radius.vertical_radius.to_px(node, reference_rect.height()) },
+        .top_right = { top_right_radius.horizontal_radius.to_px(node, reference_rect.width()), top_right_radius.vertical_radius.to_px(node, reference_rect.height()) },
+        .bottom_right = { bottom_right_radius.horizontal_radius.to_px(node, reference_rect.width()), bottom_right_radius.vertical_radius.to_px(node, reference_rect.height()) },
+        .bottom_left = { bottom_left_radius.horizontal_radius.to_px(node, reference_rect.width()), bottom_left_radius.vertical_radius.to_px(node, reference_rect.height()) }
     };
 
     // Scale overlapping curves according to https://www.w3.org/TR/css-backgrounds-3/#corner-overlap
@@ -247,14 +238,14 @@ Painting::BorderRadiiData normalize_border_radii_data(Layout::Node const& node, 
         auto s_left = radii_px.bottom_left.vertical_radius + radii_px.top_left.vertical_radius;
 
         CSSPixelFraction f = 1;
-        if (s_top > rect.width())
-            f = min(f, rect.width() / s_top);
-        if (s_right > rect.height())
-            f = min(f, rect.height() / s_right);
-        if (s_bottom > rect.width())
-            f = min(f, rect.width() / s_bottom);
-        if (s_left > rect.height())
-            f = min(f, rect.height() / s_left);
+        if (s_top > border_rect.width())
+            f = min(f, border_rect.width() / s_top);
+        if (s_right > border_rect.height())
+            f = min(f, border_rect.height() / s_right);
+        if (s_bottom > border_rect.width())
+            f = min(f, border_rect.width() / s_bottom);
+        if (s_left > border_rect.height())
+            f = min(f, border_rect.height() / s_left);
 
         // If f is 1 or more, the radii fit perfectly and no more scaling is needed
         if (f >= 1)
@@ -286,7 +277,9 @@ Paintable::SelectionStyle Paintable::selection_style() const
     if (!node)
         return default_style;
 
-    auto element = is<DOM::Element>(*node) ? as<DOM::Element>(*node) : node->parent_element();
+    DOM::Element const* element = as_if<DOM::Element>(*node);
+    if (!element)
+        element = node->parent_element();
     if (!element)
         return default_style;
 

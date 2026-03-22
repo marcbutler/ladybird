@@ -26,7 +26,7 @@ enum EscapeMode {
     StringLiteral,
 }
 
-impl<'a> Parser<'a> {
+impl Parser<'_> {
     pub(crate) fn match_expression(&mut self) -> bool {
         match self.current_token_type() {
             TokenType::BoolLiteral
@@ -194,6 +194,7 @@ impl<'a> Parser<'a> {
         }
 
         let lhs_start = self.position();
+        self.last_primary_was_parenthesized = false;
         let (expression, should_continue) = self.parse_primary_expression(min_precedence);
 
         // C++ checks for freestanding `arguments` references here (after
@@ -201,20 +202,31 @@ impl<'a> Parser<'a> {
         // falsely flagging parameter names like `function f(arguments)`.
         if let ExpressionKind::Identifier(ref id) = expression.inner
             && id.name == utf16!("arguments")
-            && !self.flags.strict_mode
-            && !self
-                .scope_collector
-                .has_declaration_in_current_function(&id.name)
         {
-            self.scope_collector
-                .set_contains_access_to_arguments_object_in_non_strict_mode();
+            // https://tc39.es/ecma262/#sec-class-static-initialization-blocks
+            // It is a Syntax Error if ContainsArguments of ClassStaticBlockBody is true.
+            if self.flags.in_class_static_init_block {
+                self.syntax_error(
+                    "'arguments' is not allowed in class static initialization blocks",
+                );
+            } else if !self.flags.strict_mode
+                && !self
+                    .scope_collector
+                    .has_declaration_in_current_function(&id.name)
+            {
+                self.scope_collector
+                    .set_contains_access_to_arguments_object_in_non_strict_mode();
+            }
         }
 
         if !should_continue {
             // Yield/Await expressions don't participate in secondary expression
             // parsing (e.g. member access), but they DO participate in comma
             // expressions (e.g. `yield 1, yield 2`). Check for comma here.
-            return self.parse_comma_expression(lhs_start, expression, min_precedence, forbidden);
+            let expression =
+                self.parse_comma_expression(lhs_start, expression, min_precedence, forbidden);
+            self.report_invalid_private_identifier_usage(&expression);
+            return expression;
         }
 
         let expression = self.parse_tagged_template_literals(lhs_start, expression);
@@ -237,6 +249,8 @@ impl<'a> Parser<'a> {
         mut forbidden: ForbiddenTokens,
     ) -> Expression {
         let original_forbidden = forbidden;
+        let mut lhs_is_parenthesized = self.last_primary_was_parenthesized;
+        self.last_primary_was_parenthesized = false;
         while self.match_secondary_expression(&forbidden) {
             let new_precedence = Self::operator_precedence(self.current_token_type());
             if new_precedence < min_precedence {
@@ -251,7 +265,9 @@ impl<'a> Parser<'a> {
                 expression,
                 new_precedence,
                 original_forbidden,
+                lhs_is_parenthesized,
             );
+            lhs_is_parenthesized = false;
             expression = result.0;
             forbidden = forbidden.merge(result.1);
 
@@ -263,7 +279,10 @@ impl<'a> Parser<'a> {
             }
         }
 
-        self.parse_comma_expression(lhs_start, expression, min_precedence, forbidden)
+        let expression =
+            self.parse_comma_expression(lhs_start, expression, min_precedence, forbidden);
+        self.report_invalid_private_identifier_usage(&expression);
+        expression
     }
 
     fn parse_comma_expression(
@@ -277,14 +296,23 @@ impl<'a> Parser<'a> {
             && self.match_token(TokenType::Comma)
             && forbidden.allows(TokenType::Comma)
         {
+            self.report_invalid_private_identifier_usage(&expression);
             let mut expressions = vec![expression];
             while self.match_token(TokenType::Comma) {
                 self.consume();
-                expressions.push(self.parse_assignment_expression());
+                let expression = self.parse_assignment_expression();
+                self.report_invalid_private_identifier_usage(&expression);
+                expressions.push(expression);
             }
             return self.expression(start, ExpressionKind::Sequence(expressions));
         }
         expression
+    }
+
+    fn report_invalid_private_identifier_usage(&mut self, expression: &Expression) {
+        if matches!(expression.inner, ExpressionKind::PrivateIdentifier(_)) {
+            self.syntax_error("Private identifier must be followed by 'in'");
+        }
     }
 
     /// Parse a primary expression (literal, identifier, `this`, etc.).
@@ -308,8 +336,13 @@ impl<'a> Parser<'a> {
                     self.consume();
                     return (self.expression(start, ExpressionKind::Error), true);
                 }
-                let expression = self.parse_expression_any();
+                let mut expression = self.parse_expression_any();
                 self.consume_token(TokenType::ParenClose);
+                if let ExpressionKind::New(ref mut new_expression) = expression.inner {
+                    // Mirrors C++ Parser: `(new Foo)` sets "inside grouping parens".
+                    new_expression.is_inside_parens = true;
+                }
+                self.last_primary_was_parenthesized = true;
                 (expression, true)
             }
 
@@ -461,6 +494,13 @@ impl<'a> Parser<'a> {
                     true,
                     None,
                 ) {
+                    return (arrow, false);
+                }
+                self.arrow_function_failed_positions
+                    .remove(&(start.offset as usize));
+                // `async => ...` is a regular arrow function with parameter name `async`
+                // (not an async arrow function).
+                if let Some(arrow) = self.try_parse_arrow_function_expression(false, false, None) {
                     return (arrow, false);
                 }
                 let token = self.consume_and_check_identifier();
@@ -674,9 +714,14 @@ impl<'a> Parser<'a> {
         lhs: Expression,
         min_precedence: i32,
         forbidden: ForbiddenTokens,
+        lhs_is_parenthesized: bool,
     ) -> (Expression, ForbiddenTokens) {
         let start = self.position();
         let tt = self.current_token_type();
+
+        if matches!(lhs.inner, ExpressionKind::PrivateIdentifier(_)) && tt != TokenType::In {
+            self.syntax_error("Private identifier must be followed by 'in'");
+        }
 
         match tt {
             // === Binary operators ===
@@ -700,7 +745,6 @@ impl<'a> Parser<'a> {
             | TokenType::ExclamationMarkEquals
             | TokenType::EqualsEqualsEquals
             | TokenType::ExclamationMarkEqualsEquals
-            | TokenType::In
             | TokenType::Instanceof => {
                 let op = token_to_binary_op(tt);
                 self.consume();
@@ -714,6 +758,34 @@ impl<'a> Parser<'a> {
                         start,
                         ExpressionKind::Binary {
                             op,
+                            lhs: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                    ),
+                    ForbiddenTokens::none(),
+                )
+            }
+
+            TokenType::In => {
+                let is_private_in = matches!(&lhs.inner, ExpressionKind::PrivateIdentifier(_));
+                self.consume();
+                let rhs = self.parse_expression(
+                    min_precedence,
+                    Self::operator_associativity(tt),
+                    forbidden,
+                );
+                if is_private_in
+                    && let ExpressionKind::Function(fn_id) = &rhs.inner
+                    && self.function_table.get(*fn_id).is_arrow_function
+                {
+                    self.syntax_error("Arrow function is not allowed as the right-hand side of a private 'in' expression");
+                }
+
+                (
+                    self.expression(
+                        start,
+                        ExpressionKind::Binary {
+                            op: BinaryOp::In,
                             lhs: Box::new(lhs),
                             rhs: Box::new(rhs),
                         },
@@ -796,6 +868,7 @@ impl<'a> Parser<'a> {
             | TokenType::DoubleQuestionMarkEquals => {
                 let op = token_to_assignment_op(tt);
                 if op == AssignmentOp::Assignment
+                    && !lhs_is_parenthesized
                     && (Self::is_object_expression(&lhs) || Self::is_array_expression(&lhs))
                 {
                     // Save pattern_bound_names so that an outer binding
@@ -805,36 +878,32 @@ impl<'a> Parser<'a> {
                     // lhs_start. When the expression is parenthesized (e.g.
                     // `([a,b]) = ...`), lhs_start points to `(` but we need
                     // to re-lex from `[` to correctly synthesize the pattern.
-                    match self.synthesize_binding_pattern(lhs.range.start) {
-                        Some(binding_pattern) => {
-                            // Register synthesized identifiers with the scope collector so
-                            // they get resolved as locals during analyze().
-                            for (name, id) in self.pattern_bound_names.drain(..) {
-                                self.scope_collector.register_identifier(id, &name, None);
-                            }
-                            self.pattern_bound_names = saved_bound_names;
-                            self.consume();
-                            let rhs = self.parse_expression(
-                                min_precedence,
-                                Associativity::Right,
-                                forbidden,
-                            );
-                            return (
-                                self.expression(
-                                    start,
-                                    ExpressionKind::Assignment {
-                                        op,
-                                        lhs: AssignmentLhs::Pattern(binding_pattern),
-                                        rhs: Box::new(rhs),
-                                    },
-                                ),
-                                ForbiddenTokens::none(),
-                            );
-                        }
-                        _ => {
-                            self.pattern_bound_names = saved_bound_names;
-                        }
+
+                    let binding_pattern = self.synthesize_binding_pattern(lhs.range.start);
+
+                    // Register synthesized identifiers with the scope collector so
+                    // they get resolved as locals during analyze().
+                    let bound_names: Vec<_> = self.pattern_bound_names.drain(..).collect();
+                    for (name, id) in &bound_names {
+                        self.check_identifier_name_for_assignment_validity(name, false);
+                        self.scope_collector
+                            .register_identifier(id.clone(), name, None);
                     }
+                    self.pattern_bound_names = saved_bound_names;
+                    self.consume();
+                    let rhs =
+                        self.parse_expression(min_precedence, Associativity::Right, forbidden);
+                    return (
+                        self.expression(
+                            start,
+                            ExpressionKind::Assignment {
+                                op,
+                                lhs: AssignmentLhs::Pattern(binding_pattern),
+                                rhs: Box::new(rhs),
+                            },
+                        ),
+                        ForbiddenTokens::none(),
+                    );
                 }
                 let allow_call = !matches!(
                     tt,
@@ -842,7 +911,7 @@ impl<'a> Parser<'a> {
                         | TokenType::DoublePipeEquals
                         | TokenType::DoubleQuestionMarkEquals
                 );
-                if !Self::is_simple_assignment_target(&lhs, allow_call) {
+                if !Self::is_simple_assignment_target(&lhs, allow_call, self.flags.strict_mode) {
                     self.syntax_error("Invalid left-hand side in assignment");
                 }
                 if let ExpressionKind::Identifier(ref id) = lhs.inner {
@@ -887,6 +956,12 @@ impl<'a> Parser<'a> {
             TokenType::Period => {
                 self.consume();
                 if self.match_token(TokenType::PrivateIdentifier) {
+                    // https://tc39.es/ecma262/#sec-static-semantics-early-errors
+                    // It is a Syntax Error if MemberExpression is SuperProperty
+                    // and the PrivateIdentifier is present.
+                    if matches!(lhs.inner, ExpressionKind::Super) {
+                        self.syntax_error("Cannot access private field or method via 'super'");
+                    }
                     // C++ uses rule_start (period position) for property identifiers.
                     let id = self.parse_private_identifier(start);
                     let property = self.expression(start, ExpressionKind::PrivateIdentifier(id));
@@ -952,6 +1027,20 @@ impl<'a> Parser<'a> {
 
             // === Optional chaining ===
             TokenType::QuestionMarkPeriod => {
+                // https://tc39.es/ecma262/#prod-OptionalExpression
+                // Optional chaining directly on an unparenthesized `new` expression is invalid:
+                //   `new Foo?.bar`  // SyntaxError
+                // while parenthesized/new-call forms remain valid:
+                //   `(new Foo)?.bar`
+                //   `new Foo()?.bar`
+                if let ExpressionKind::New(ref new_expression) = lhs.inner
+                    && !new_expression.is_parenthesized
+                    && !new_expression.is_inside_parens
+                {
+                    self.syntax_error("'new' cannot be used with optional chaining");
+                    self.consume();
+                    return (lhs, ForbiddenTokens::none());
+                }
                 let chain = self.parse_optional_chain(start, lhs);
                 (chain, ForbiddenTokens::none())
             }
@@ -963,7 +1052,7 @@ impl<'a> Parser<'a> {
             // NB: The [no LineTerminator here] is enforced by match_secondary_expression
             // which checks trivia_has_line_terminator for PlusPlus/MinusMinus.
             TokenType::PlusPlus => {
-                if !Self::is_simple_assignment_target(&lhs, true) {
+                if !Self::is_simple_assignment_target(&lhs, true, self.flags.strict_mode) {
                     self.syntax_error("Invalid left-hand side in postfix operation");
                 }
                 if let ExpressionKind::Identifier(ref id) = lhs.inner {
@@ -983,7 +1072,7 @@ impl<'a> Parser<'a> {
                 )
             }
             TokenType::MinusMinus => {
-                if !Self::is_simple_assignment_target(&lhs, true) {
+                if !Self::is_simple_assignment_target(&lhs, true, self.flags.strict_mode) {
                     self.syntax_error("Invalid left-hand side in postfix operation");
                 }
                 if let ExpressionKind::Identifier(ref id) = lhs.inner {
@@ -1022,7 +1111,7 @@ impl<'a> Parser<'a> {
                     Associativity::Right,
                     ForbiddenTokens::none(),
                 );
-                if !Self::is_simple_assignment_target(&expression, true) {
+                if !Self::is_simple_assignment_target(&expression, true, self.flags.strict_mode) {
                     self.syntax_error("Invalid left-hand side in prefix operation");
                 }
                 if let ExpressionKind::Identifier(ref id) = expression.inner {
@@ -1044,7 +1133,7 @@ impl<'a> Parser<'a> {
                     Associativity::Right,
                     ForbiddenTokens::none(),
                 );
-                if !Self::is_simple_assignment_target(&expression, true) {
+                if !Self::is_simple_assignment_target(&expression, true, self.flags.strict_mode) {
                     self.syntax_error("Invalid left-hand side in prefix operation");
                 }
                 if let ExpressionKind::Identifier(ref id) = expression.inner {
@@ -1079,6 +1168,7 @@ impl<'a> Parser<'a> {
                     Associativity::Right,
                     ForbiddenTokens::none(),
                 );
+                self.report_invalid_private_identifier_usage(&expression);
                 self.expression(
                     start,
                     ExpressionKind::Unary {
@@ -1098,6 +1188,7 @@ impl<'a> Parser<'a> {
                     Associativity::Right,
                     ForbiddenTokens::none(),
                 );
+                self.report_invalid_private_identifier_usage(&expression);
                 if self.flags.strict_mode && Self::is_identifier(&expression) {
                     self.syntax_error_at(
                         "Delete of an unqualified identifier in strict mode.",
@@ -1147,10 +1238,7 @@ impl<'a> Parser<'a> {
             // It is a Syntax Error if NewTarget is not enclosed, directly or indirectly
             // (but not crossing function or class static initialization block boundaries),
             // within a FunctionBody, ConciseBody, ClassStaticBlock, or ClassBody.
-            if !self.flags.in_function_context
-                && !self.in_eval_function_context
-                && !self.flags.in_class_static_init_block
-            {
+            if !self.flags.new_target_is_valid && !self.in_eval_function_context {
                 self.syntax_error("'new.target' not allowed outside of a function");
             }
             if self.scope_collector.has_current_scope() {
@@ -1181,7 +1269,8 @@ impl<'a> Parser<'a> {
                 ExpressionKind::New(CallExpressionData {
                     callee: Box::new(callee),
                     arguments,
-                    is_parenthesized: false,
+                    // Mirrors C++ InvocationStyle::Parenthesized for `new Foo(...)`.
+                    is_parenthesized: true,
                     is_inside_parens: false,
                 }),
             )
@@ -1588,6 +1677,10 @@ impl<'a> Parser<'a> {
         if is_async {
             self.syntax_error("Expected function after async keyword");
         }
+        // Generator shorthand requires a method body.
+        if is_generator {
+            self.syntax_error("Expected method after generator star");
+        }
 
         if is_getter || is_setter {
             let method_kind = if is_getter {
@@ -1671,7 +1764,7 @@ impl<'a> Parser<'a> {
             // Strict-mode reserved words cannot be used as shorthand properties.
             if self.flags.strict_mode && is_strict_reserved_word(&kv) {
                 let name_str = String::from_utf16_lossy(&kv);
-                self.syntax_error(&format!("'{}' is a reserved keyword", name_str));
+                self.syntax_error(&format!("'{name_str}' is a reserved keyword"));
             }
             let id = self.make_identifier(obj_start, kv);
             self.scope_collector
@@ -1962,7 +2055,7 @@ impl<'a> Parser<'a> {
                         ),
                         // C++ uses rule_start (template literal start) for NullLiteral.
                         None => {
-                            expressions.push(self.expression(start, ExpressionKind::NullLiteral))
+                            expressions.push(self.expression(start, ExpressionKind::NullLiteral));
                         }
                     }
                 } else {
@@ -2203,7 +2296,7 @@ fn process_escape_sequences_impl(input: &[u16], mode: EscapeMode) -> EscapeResul
     }
 }
 
-impl<'a> Parser<'a> {
+impl Parser<'_> {
     /// Try to parse an arrow function expression, with memoization.
     /// If a previous attempt at this position already failed, returns `None`
     /// immediately. Otherwise attempts the parse and caches the failure.
@@ -2394,8 +2487,12 @@ impl<'a> Parser<'a> {
             self.scope_collector.close_scope();
             self.pattern_bound_names = saved_pattern_bound_names;
 
-            if has_use_strict || fn_kind != FunctionKind::Normal {
-                self.check_parameters_post_body(&parameter_info, has_use_strict, fn_kind);
+            if has_use_strict || fn_kind != FunctionKind::Normal || self.flags.strict_mode {
+                self.check_parameters_post_body(
+                    &parameter_info,
+                    has_use_strict || self.flags.strict_mode,
+                    fn_kind,
+                );
             }
 
             self.flags.await_expression_is_valid = saved_await_body;
@@ -2442,6 +2539,10 @@ impl<'a> Parser<'a> {
             self.scope_collector.close_scope();
             self.pattern_bound_names = saved_pattern_bound_names;
 
+            if self.flags.strict_mode || fn_kind != FunctionKind::Normal {
+                self.check_parameters_post_body(&parameter_info, self.flags.strict_mode, fn_kind);
+            }
+
             self.flags.await_expression_is_valid = saved_await_body;
             self.flags.in_class_static_init_block = saved_static_init;
             self.flags.in_formal_parameter_context = saved_formal_parameter_ctx;
@@ -2484,6 +2585,7 @@ impl<'a> Parser<'a> {
         let saved_field_init = self.flags.in_class_field_initializer;
         let saved_allow_super_call = self.flags.allow_super_constructor_call;
         let saved_allow_super_lookup = self.flags.allow_super_property_lookup;
+        let saved_new_target = self.flags.new_target_is_valid;
         self.flags.in_generator_function_context = is_generator;
         self.flags.await_expression_is_valid = is_async;
         self.flags.in_class_static_init_block = false;
@@ -2491,6 +2593,7 @@ impl<'a> Parser<'a> {
         self.flags.allow_super_constructor_call =
             method_kind == MethodKind::Constructor && self.class_has_super_class;
         self.flags.allow_super_property_lookup = true;
+        self.flags.new_target_is_valid = true;
 
         // Save pattern_bound_names so that destructuring patterns in the
         // method body don't steal names from an outer binding context.
@@ -2521,12 +2624,16 @@ impl<'a> Parser<'a> {
         self.scope_collector.close_scope();
         self.pattern_bound_names = saved_pattern_bound_names;
 
-        self.flags.in_class_static_init_block = saved_static_init;
-        self.flags.in_class_field_initializer = saved_field_init;
-
+        // Check parameters before restoring flags so that the method's
+        // context is used (e.g. in_class_static_init_block must remain
+        // false to allow `await` as a parameter name in generators).
         if has_use_strict || fn_kind != FunctionKind::Normal {
             self.check_parameters_post_body(&parsed.parameter_info, has_use_strict, fn_kind);
         }
+
+        self.flags.in_class_static_init_block = saved_static_init;
+        self.flags.in_class_field_initializer = saved_field_init;
+        self.flags.new_target_is_valid = saved_new_target;
 
         insights.might_need_arguments_object = self.flags.function_might_need_arguments_object;
         self.flags.function_might_need_arguments_object = saved_might_need_arguments;

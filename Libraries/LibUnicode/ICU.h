@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025, Tim Flynn <trflynn89@ladybird.org>
+ * Copyright (c) 2024-2026, Tim Flynn <trflynn89@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -25,7 +25,6 @@
 #include <unicode/uversion.h>
 
 U_NAMESPACE_BEGIN
-class Calendar;
 class DateTimePatternGenerator;
 class LocaleDisplayNames;
 class NumberingSystem;
@@ -38,10 +37,9 @@ namespace Unicode {
 class LocaleData {
 public:
     static Optional<LocaleData&> for_locale(StringView locale);
+    static String canonicalize(StringView locale);
 
     ALWAYS_INLINE icu::Locale& locale() { return m_locale; }
-
-    String to_string();
 
     icu::LocaleDisplayNames& standard_display_names();
     icu::LocaleDisplayNames& dialect_display_names();
@@ -59,7 +57,7 @@ private:
     explicit LocaleData(icu::Locale locale);
 
     icu::Locale m_locale;
-    Optional<String> m_locale_string;
+    Optional<String> m_canonical_locale_string;
 
     OwnPtr<icu::LocaleDisplayNames> m_standard_display_names;
     OwnPtr<icu::LocaleDisplayNames> m_dialect_display_names;
@@ -67,20 +65,6 @@ private:
     OwnPtr<icu::DateTimePatternGenerator> m_date_time_pattern_generator;
     OwnPtr<icu::TimeZoneNames> m_time_zone_names;
     Optional<DigitalFormat> m_digital_format;
-};
-
-class CalendarData {
-public:
-    static Optional<CalendarData&> for_calendar(String const& calendar);
-
-    static void adjust_time_range_for_proleptic_calendar(icu::Calendar&);
-
-    ALWAYS_INLINE icu::Calendar& calendar() { return *m_calendar; }
-
-private:
-    explicit CalendarData(NonnullOwnPtr<icu::Calendar>);
-
-    NonnullOwnPtr<icu::Calendar> m_calendar;
 };
 
 class TimeZoneData {
@@ -112,20 +96,6 @@ inline void verify_icu_success(UErrorCode code, SourceLocation location = Source
         VERIFY_NOT_REACHED();
     }
 }
-
-#define ICU_MUST(expression)                                                     \
-    ({                                                                           \
-        /* Ignore -Wshadow to allow nesting the macro. */                        \
-        AK_IGNORE_DIAGNOSTIC("-Wshadow", auto _temporary_result = (expression)); \
-        verify_icu_success(status);                                              \
-        _temporary_result;                                                       \
-    })
-
-#define ICU_MUST_VOID(expression)   \
-    ({                              \
-        expression;                 \
-        verify_icu_success(status); \
-    })
 
 ALWAYS_INLINE icu::StringPiece icu_string_piece(StringView string)
 {

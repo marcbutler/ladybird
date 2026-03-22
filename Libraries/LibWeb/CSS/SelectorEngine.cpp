@@ -547,7 +547,7 @@ static inline bool matches_pseudo_class(CSS::Selector::SimpleSelector::PseudoCla
         // FIXME: Maybe match this selector sometimes?
         return false;
     case CSS::PseudoClass::Active:
-        return element.is_active();
+        return element.is_being_activated();
     case CSS::PseudoClass::Hover:
         return matches_hover_pseudo_class(element);
     case CSS::PseudoClass::Focus:
@@ -679,8 +679,6 @@ static inline bool matches_pseudo_class(CSS::Selector::SimpleSelector::PseudoCla
     case CSS::PseudoClass::NthOfType:
     case CSS::PseudoClass::NthLastOfType: {
         auto const* parent = element.parent();
-        if (!parent)
-            return false;
 
         if (context.collect_per_element_selector_involvement_metadata) {
             auto& mutable_element = const_cast<DOM::Element&>(element);
@@ -704,6 +702,9 @@ static inline bool matches_pseudo_class(CSS::Selector::SimpleSelector::PseudoCla
             return list.contains([&](auto const& selector) { return matches(selector, element, shadow_host, context); });
         };
 
+        // https://drafts.csswg.org/selectors-4/#child-index
+        // The pseudo-classes defined in this section select elements based on their index amongst their inclusive siblings.
+        // NB: An element without a parent has no siblings, so its index is 1.
         int index = 1;
         switch (pseudo_class.type) {
         case CSS::PseudoClass::__Count:
@@ -711,6 +712,8 @@ static inline bool matches_pseudo_class(CSS::Selector::SimpleSelector::PseudoCla
         case CSS::PseudoClass::NthChild: {
             if (!matches_selector_list(pseudo_class.argument_selector_list, element))
                 return false;
+            if (!parent)
+                break;
             for (auto* child = parent->first_child_of_type<DOM::Element>(); child && child != &element; child = child->next_element_sibling()) {
                 if (matches_selector_list(pseudo_class.argument_selector_list, *child))
                     ++index;
@@ -720,6 +723,8 @@ static inline bool matches_pseudo_class(CSS::Selector::SimpleSelector::PseudoCla
         case CSS::PseudoClass::NthLastChild: {
             if (!matches_selector_list(pseudo_class.argument_selector_list, element))
                 return false;
+            if (!parent)
+                break;
             for (auto* child = parent->last_child_of_type<DOM::Element>(); child && child != &element; child = child->previous_element_sibling()) {
                 if (matches_selector_list(pseudo_class.argument_selector_list, *child))
                     ++index;
@@ -1199,10 +1204,17 @@ bool matches(CSS::Selector const& selector, int component_list_index, DOM::Eleme
             element_for_compound_matching = *context.part_owning_parent;
             context.part_owning_parent = nullptr;
             // Also have to update the shadow host we're using.
-            if (auto shadow_root = element_for_compound_matching->containing_shadow_root()) {
-                shadow_host = shadow_root->host();
-            } else {
-                shadow_host = nullptr;
+            // If the rule comes from the element's own shadow root, we're matching
+            // :host::part() from within the shadow DOM's own stylesheet.
+            // Keep shadow_host as-is so that :host can match.
+            auto is_internal_part = context.rule_shadow_root
+                && context.rule_shadow_root == element_for_compound_matching->shadow_root();
+            if (!is_internal_part) {
+                if (auto shadow_root = element_for_compound_matching->containing_shadow_root()) {
+                    shadow_host = shadow_root->host();
+                } else {
+                    shadow_host = nullptr;
+                }
             }
         }
     }

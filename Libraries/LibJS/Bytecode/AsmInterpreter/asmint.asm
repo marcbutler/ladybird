@@ -129,6 +129,27 @@ end
 # If src_fpr is NaN, writes CANON_NAN_BITS to dst_gpr.
 # Otherwise bitwise-copies src_fpr to dst_gpr.
 
+# Box a double result as a JS::Value, preferring Int32 when the double is a
+# whole number in [INT32_MIN, INT32_MAX] and not -0.0. This mirrors the
+# JS::Value(double) constructor so that downstream int32 fast paths fire.
+# dst: destination GPR for the boxed value.
+# src_fpr: source FPR containing the double result.
+# Clobbers: t1 (x86-64), t3, ft3 (x86-64).
+macro box_double_or_int32(dst, src_fpr)
+    double_to_int32 t3, src_fpr, .bdi_not_int
+    branch_zero t3, .bdi_check_neg_zero
+    box_int32 dst, t3
+    jmp .bdi_done
+.bdi_check_neg_zero:
+    fp_mov dst, src_fpr
+    branch_negative dst, .bdi_not_int
+    box_int32 dst, t3
+    jmp .bdi_done
+.bdi_not_int:
+    canonicalize_nan dst, src_fpr
+.bdi_done:
+end
+
 # Shared same-tag equality dispatch.
 # Expects t3=lhs_tag (known equal to rhs_tag), t1=lhs, t2=rhs.
 # For int32, boolean, object, symbol, undefined, null: bitwise compare.
@@ -291,21 +312,37 @@ macro jump_binary_epilogue(slow_path_func)
     goto_handler t0
 end
 
-# Fast path for bitwise binary operations on int32/boolean operands.
+# Coerce two operands (already in t1/t2) to int32 for bitwise operations.
+# On success: t3 = lhs as int32, t4 = rhs as int32. Falls through.
+# If either operand is not a number (int32, boolean, or double): jumps to fail.
+# Clobbers t1 (on x86_64, js_to_int32 clobbers rcx=t1), t3, t4.
+macro coerce_to_int32s(fail)
+    extract_tag t3, t1
+    branch_any_eq t3, INT32_TAG, BOOLEAN_TAG, .lhs_is_int
+    check_tag_is_double t3, fail
+    fp_mov ft0, t1
+    js_to_int32 t3, ft0, fail
+    jmp .lhs_done
+.lhs_is_int:
+    unbox_int32 t3, t1
+.lhs_done:
+    extract_tag t4, t2
+    branch_any_eq t4, INT32_TAG, BOOLEAN_TAG, .rhs_is_int
+    check_tag_is_double t4, fail
+    fp_mov ft0, t2
+    js_to_int32 t4, ft0, fail
+    jmp .rhs_done
+.rhs_is_int:
+    unbox_int32 t4, t2
+.rhs_done:
+end
+
+# Fast path for bitwise binary operations on int32/boolean/double operands.
 # op_insn: the bitwise instruction to apply (xor, and, or).
 macro bitwise_op(op_insn, slow_path_func)
     load_operand t1, m_lhs
     load_operand t2, m_rhs
-    extract_tag t3, t1
-    branch_any_eq t3, INT32_TAG, BOOLEAN_TAG, .lhs_ok
-    jmp .slow
-.lhs_ok:
-    extract_tag t4, t2
-    branch_any_eq t4, INT32_TAG, BOOLEAN_TAG, .rhs_ok
-    jmp .slow
-.rhs_ok:
-    unbox_int32 t3, t1
-    unbox_int32 t4, t2
+    coerce_to_int32s .slow
     op_insn t3, t4
     box_int32 t4, t3
     store_operand m_dst, t4
@@ -372,6 +409,24 @@ handler Mov
     dispatch_next
 end
 
+handler Mov2
+    load_operand t1, m_src1
+    store_operand m_dst1, t1
+    load_operand t2, m_src2
+    store_operand m_dst2, t2
+    dispatch_next
+end
+
+handler Mov3
+    load_operand t1, m_src1
+    store_operand m_dst1, t1
+    load_operand t2, m_src2
+    store_operand m_dst2, t2
+    load_operand t3, m_src3
+    store_operand m_dst3, t3
+    dispatch_next
+end
+
 # ============================================================================
 # Arithmetic
 # ============================================================================
@@ -379,14 +434,15 @@ end
 # Arithmetic fast path: try int32, check overflow, fall back to double, then slow path.
 # The coerce_to_doubles macro handles mixed int32+double coercion.
 # On int32 overflow, we convert both operands to double and retry.
-# canonicalize_nan ensures NaN results don't collide with the tag space.
+# box_double_or_int32 re-boxes double results as Int32 when possible,
+# mirroring JS::Value(double), so downstream int32 fast paths can fire.
 handler Add
     load_operand t1, m_lhs
     load_operand t2, m_rhs
     coerce_to_doubles .both_int, .slow
     # One or both doubles: ft0=lhs, ft1=rhs
     fp_add ft0, ft1
-    canonicalize_nan t5, ft0
+    box_double_or_int32 t5, ft0
     store_operand m_dst, t5
     dispatch_next
 .both_int:
@@ -417,7 +473,7 @@ handler Sub
     coerce_to_doubles .both_int, .slow
     # One or both doubles: ft0=lhs, ft1=rhs
     fp_sub ft0, ft1
-    canonicalize_nan t5, ft0
+    box_double_or_int32 t5, ft0
     store_operand m_dst, t5
     dispatch_next
 .both_int:
@@ -447,7 +503,7 @@ handler Mul
     coerce_to_doubles .both_int, .slow
     # One or both doubles: ft0=lhs, ft1=rhs
     fp_mul ft0, ft1
-    canonicalize_nan t5, ft0
+    box_double_or_int32 t5, ft0
     store_operand m_dst, t5
     dispatch_next
 .both_int:
@@ -1265,14 +1321,14 @@ handler ToInt32
     # Without: truncate + round-trip check, slow path on mismatch.
     fp_mov ft0, t1
     js_to_int32 t2, ft0, .slow
-    box_int32 t3, t2
-    store_operand m_dst, t3
+    box_int32_clean t2, t2
+    store_operand m_dst, t2
     dispatch_next
 .try_boolean:
     branch_ne t2, BOOLEAN_TAG, .slow
     # Convert boolean to int32: false -> 0, true -> 1
     and t1, 1
-    box_int32 t1, t1
+    box_int32_clean t1, t1
     store_operand m_dst, t1
     dispatch_next
 .slow:
@@ -1284,8 +1340,11 @@ end
 # Property access (indexed + named + inline caches)
 # ============================================================================
 
-# Fast path for array[int32_index] = value with simple indexed storage.
+# Fast path for array[int32_index] = value with Packed/Holey indexed storage.
 handler PutByValue
+    # Only fast-path Normal puts (not Getter/Setter/Own)
+    load8 t0, [pb, pc, m_kind]
+    branch_ne t0, PUT_KIND_NORMAL, .slow
     load_operand t1, m_base
     load_operand t2, m_property
     # Check base is an object
@@ -1305,55 +1364,38 @@ handler PutByValue
     branch_bits_set t0, OBJECT_FLAG_IS_TYPED_ARRAY, .try_typed_array
     # Check !may_interfere_with_indexed_property_access
     branch_bits_set t0, OBJECT_FLAG_MAY_INTERFERE, .slow
-    # Load indexed property storage pointer
-    load64 t0, [t3, OBJECT_INDEXED_PROPERTIES]
-    branch_zero t0, .slow
-    # Check is_simple_storage
-    load8 t5, [t0, INDEXED_PROPERTY_STORAGE_IS_SIMPLE]
-    branch_zero t5, .slow
-    # Check index < m_array_size
-    load64 t5, [t0, INDEXED_PROPERTY_STORAGE_ARRAY_SIZE]
+    # Packed is the hot path: existing elements can be overwritten directly.
+    load8 t0, [t3, OBJECT_INDEXED_STORAGE_KIND]
+    branch_ne t0, INDEXED_STORAGE_KIND_PACKED, .not_packed
+    # Check index vs array_like_size
+    load32 t5, [t3, OBJECT_INDEXED_ARRAY_LIKE_SIZE]
     branch_ge_unsigned t4, t5, .slow
-    # Check existing value is not empty (hole) - holes need prototype chain lookup
-    load64 t5, [t0, SIMPLE_INDEXED_PROPERTY_STORAGE_PACKED_DATA]
+    load64 t5, [t3, OBJECT_INDEXED_ELEMENTS]
+    load_operand t1, m_src
+    store64 [t5, t4, 8], t1
+    dispatch_next
+.not_packed:
+    branch_ne t0, INDEXED_STORAGE_KIND_HOLEY, .slow
+    # Holey arrays need a slot load to distinguish existing elements from holes.
+    load32 t5, [t3, OBJECT_INDEXED_ARRAY_LIKE_SIZE]
+    branch_ge_unsigned t4, t5, .slow
+    load64 t5, [t3, OBJECT_INDEXED_ELEMENTS]
     load64 t1, [t5, t4, 8]
     mov t0, EMPTY_TAG_SHIFTED
     branch_eq t1, t0, .slow
-    # Store value to m_packed_elements.data()[index]
     load_operand t1, m_src
     store64 [t5, t4, 8], t1
     dispatch_next
 .try_typed_array:
     # t3 = Object*, t4 = index (u32, non-negative)
-    # Check array_length variant holds a u32 (index byte == 2)
-    load8 t0, [t3, TYPED_ARRAY_ARRAY_LENGTH_INDEX]
-    branch_ne t0, BYTE_LENGTH_U32_INDEX, .try_typed_array_slow
-    # Load array length, check index in bounds
-    load32 t5, [t3, TYPED_ARRAY_ARRAY_LENGTH_VALUE]
-    branch_ge_unsigned t4, t5, .slow
-    # Load ArrayBuffer* from m_viewed_array_buffer
-    load64 t0, [t3, TYPED_ARRAY_VIEWED_BUFFER]
-    # Check buffer is fixed-length (not resizable)
-    # ARRAY_BUFFER_IS_FIXED_LENGTH_OFFSET points to Optional<size_t>::m_has_value
-    # If has_value is true, the buffer has a max_byte_length (= resizable)
-    load8 t5, [t0, ARRAY_BUFFER_IS_FIXED_LENGTH_OFFSET]
-    branch_nonzero t5, .slow
-    # Check ArrayBuffer Variant index == 1 (ByteBuffer, not detached/empty)
-    load8 t5, [t0, ARRAY_BUFFER_BYTE_BUFFER_VARIANT_INDEX]
-    branch_ne t5, ARRAY_BUFFER_BYTE_BUFFER_BYTEBUFFER_INDEX, .try_typed_array_slow
-    # Check if ByteBuffer is using inline or outline storage
-    load8 t5, [t0, ARRAY_BUFFER_BYTE_BUFFER_INLINE]
-    branch_nonzero t5, .ta_inline_buffer
-    # Outline: load the m_outline_buffer pointer
-    load64 t5, [t0, ARRAY_BUFFER_BYTE_BUFFER_OUTLINE_POINTER]
-    jmp .ta_have_data_ptr
-.ta_inline_buffer:
-    # Inline: data is at the start of the ByteBuffer (within Variant data)
-    lea t5, [t0, ARRAY_BUFFER_BYTE_BUFFER_OFFSET]
-.ta_have_data_ptr:
-    # Add byte_offset
-    load32 t0, [t3, TYPED_ARRAY_BYTE_OFFSET]
-    add t5, t0
+    # Load cached data pointer (pre-computed: buffer.data() + byte_offset)
+    # nullptr means uncached -> C++ helper will resolve the access.
+    load64 t5, [t3, TYPED_ARRAY_CACHED_DATA_PTR]
+    branch_zero t5, .try_typed_array_slow
+    # Cached pointers only exist for fixed-length typed arrays, so array_length
+    # is known to hold a concrete u32 value here.
+    load32 t0, [t3, TYPED_ARRAY_ARRAY_LENGTH_VALUE]
+    branch_ge_unsigned t4, t0, .slow
     # t5 = data base pointer, t4 = index
     # Load kind into t2 before load_operand clobbers t0
     load8 t2, [t3, TYPED_ARRAY_KIND]
@@ -1362,7 +1404,8 @@ handler PutByValue
     # Check if source is int32
     extract_tag t0, t1
     branch_eq t0, INT32_TAG, .ta_store_int32
-    # Non-int32 value: only handle Float64Array with double source
+    # Non-int32 value: only handle float typed arrays with double sources
+    branch_eq t2, TYPED_ARRAY_KIND_FLOAT32, .ta_store_float32
     branch_ne t2, TYPED_ARRAY_KIND_FLOAT64, .try_typed_array_slow
     # Compute store address before check_is_double clobbers t4
     mov t0, t4
@@ -1373,17 +1416,49 @@ handler PutByValue
     # Float64Array: store raw double bits
     store64 [t0, 0], t1
     dispatch_next
+.ta_store_float32:
+    mov t0, t4
+    shl t0, 2
+    add t0, t5
+    check_is_double t1, .try_typed_array_slow
+    fp_mov ft0, t1
+    double_to_float ft0, ft0
+    storef32 [t0, 0], ft0
+    dispatch_next
 .ta_store_int32:
-    # t1 = NaN-boxed int32, extract low 32 bits into t0
-    mov t0, t1
-    and t0, 0xFFFFFFFF
+    # t1 = NaN-boxed int32, sign-extend it into t0
+    unbox_int32 t0, t1
     # Dispatch on kind (in t2)
     branch_any_eq t2, TYPED_ARRAY_KIND_INT32, TYPED_ARRAY_KIND_UINT32, .ta_put_int32
+    branch_eq t2, TYPED_ARRAY_KIND_FLOAT32, .ta_put_float32
+    branch_eq t2, TYPED_ARRAY_KIND_UINT8_CLAMPED, .ta_put_uint8_clamped
     branch_any_eq t2, TYPED_ARRAY_KIND_UINT8, TYPED_ARRAY_KIND_INT8, .ta_put_uint8
     branch_any_eq t2, TYPED_ARRAY_KIND_UINT16, TYPED_ARRAY_KIND_INT16, .ta_put_uint16
     jmp .try_typed_array_slow
 .ta_put_int32:
     store32 [t5, t4, 4], t0
+    dispatch_next
+.ta_put_float32:
+    int_to_double ft0, t0
+    double_to_float ft0, ft0
+    mov t3, t4
+    shl t3, 2
+    add t3, t5
+    storef32 [t3, 0], ft0
+    dispatch_next
+.ta_put_uint8_clamped:
+    branch_negative t0, .ta_put_uint8_clamped_zero
+    mov t3, 255
+    branch_ge_unsigned t0, t3, .ta_put_uint8_clamped_max
+    store8 [t5, t4], t0
+    dispatch_next
+.ta_put_uint8_clamped_zero:
+    mov t0, 0
+    store8 [t5, t4], t0
+    dispatch_next
+.ta_put_uint8_clamped_max:
+    mov t0, 255
+    store8 [t5, t4], t0
     dispatch_next
 .ta_put_uint8:
     store8 [t5, t4], t0
@@ -1426,7 +1501,7 @@ handler GetById
     branch_ne t0, t2, .try_cache
     # IC hit! Load property value via get_direct (own property)
     load32 t0, [t5, PROPERTY_LOOKUP_CACHE_ENTRY0_PROPERTY_OFFSET]
-    load64 t5, [t3, OBJECT_STORAGE_DATA]
+    load64 t5, [t3, OBJECT_NAMED_PROPERTIES]
     load64 t0, [t5, t0, 8]
     # Check value is not an accessor
     extract_tag t2, t0
@@ -1446,7 +1521,7 @@ handler GetById
     branch_ne t1, t2, .try_cache
     # IC hit! Load property value via get_direct (from prototype)
     load32 t1, [t5, PROPERTY_LOOKUP_CACHE_ENTRY0_PROPERTY_OFFSET]
-    load64 t2, [t0, OBJECT_STORAGE_DATA]
+    load64 t2, [t0, OBJECT_NAMED_PROPERTIES]
     load64 t0, [t2, t1, 8]
     # Check value is not an accessor
     extract_tag t2, t0
@@ -1487,7 +1562,7 @@ handler PutById
     branch_ne t0, t2, .try_cache
     # Check current value at property_offset is not an accessor
     load32 t0, [t5, PROPERTY_LOOKUP_CACHE_ENTRY0_PROPERTY_OFFSET]
-    load64 t5, [t3, OBJECT_STORAGE_DATA]
+    load64 t5, [t3, OBJECT_NAMED_PROPERTIES]
     load64 t2, [t5, t0, 8]
     extract_tag t4, t2
     branch_eq t4, ACCESSOR_TAG, .try_cache
@@ -1507,7 +1582,7 @@ handler PutById
     dispatch_next
 end
 
-# Fast path for array[int32_index] with simple indexed storage.
+# Fast path for array[int32_index] with Packed/Holey indexed storage.
 handler GetByValue
     load_operand t1, m_base
     load_operand t2, m_property
@@ -1529,66 +1604,49 @@ handler GetByValue
     branch_bits_set t0, OBJECT_FLAG_IS_TYPED_ARRAY, .try_typed_array
     # Check !may_interfere_with_indexed_property_access
     branch_bits_set t0, OBJECT_FLAG_MAY_INTERFERE, .slow
-    # Load indexed property storage pointer
-    load64 t0, [t3, OBJECT_INDEXED_PROPERTIES]
-    branch_zero t0, .slow
-    # Check is_simple_storage
-    load8 t5, [t0, INDEXED_PROPERTY_STORAGE_IS_SIMPLE]
-    branch_zero t5, .slow
-    # Check index < m_array_size
-    load64 t5, [t0, INDEXED_PROPERTY_STORAGE_ARRAY_SIZE]
+    # Packed is the hot path: in-bounds elements are always present.
+    load8 t0, [t3, OBJECT_INDEXED_STORAGE_KIND]
+    branch_ne t0, INDEXED_STORAGE_KIND_PACKED, .not_packed
+    # Check index < array_like_size
+    load32 t5, [t3, OBJECT_INDEXED_ARRAY_LIKE_SIZE]
     branch_ge_unsigned t4, t5, .slow
-    # Load value from m_packed_elements.data()[index]
-    load64 t5, [t0, SIMPLE_INDEXED_PROPERTY_STORAGE_PACKED_DATA]
+    load64 t5, [t3, OBJECT_INDEXED_ELEMENTS]
     load64 t0, [t5, t4, 8]
-    # Check value is not empty (sparse hole)
+    # NB: No accessor check needed -- Packed/Holey storage
+    #     can only hold default-attributed data properties.
+    store_operand m_dst, t0
+    dispatch_next
+.not_packed:
+    branch_ne t0, INDEXED_STORAGE_KIND_HOLEY, .slow
+    # Holey arrays need a slot load to distinguish present elements from holes.
+    load32 t5, [t3, OBJECT_INDEXED_ARRAY_LIKE_SIZE]
+    branch_ge_unsigned t4, t5, .slow
+    load64 t5, [t3, OBJECT_INDEXED_ELEMENTS]
+    load64 t0, [t5, t4, 8]
     mov t5, EMPTY_TAG_SHIFTED
     branch_eq t0, t5, .slow
-    # NB: No accessor check needed -- SimpleIndexedPropertyStorage
-    #     can only hold default-attributed data properties.
     store_operand m_dst, t0
     dispatch_next
 .try_typed_array:
     # t3 = Object*, t4 = index (u32, non-negative)
-    # Check array_length variant holds a u32 (index byte == 2)
-    load8 t0, [t3, TYPED_ARRAY_ARRAY_LENGTH_INDEX]
-    branch_ne t0, BYTE_LENGTH_U32_INDEX, .try_typed_array_slow
-    # Load array length, check index in bounds
-    load32 t5, [t3, TYPED_ARRAY_ARRAY_LENGTH_VALUE]
-    branch_ge_unsigned t4, t5, .try_typed_array_slow
-    # Load ArrayBuffer* from m_viewed_array_buffer
-    load64 t0, [t3, TYPED_ARRAY_VIEWED_BUFFER]
-    # Check buffer is fixed-length (not resizable)
-    # ARRAY_BUFFER_IS_FIXED_LENGTH_OFFSET points to Optional<size_t>::m_has_value
-    # If has_value is true, the buffer has a max_byte_length (= resizable)
-    load8 t5, [t0, ARRAY_BUFFER_IS_FIXED_LENGTH_OFFSET]
-    branch_nonzero t5, .slow
-    # Check ArrayBuffer Variant index == 1 (ByteBuffer, not detached/empty)
-    load8 t5, [t0, ARRAY_BUFFER_BYTE_BUFFER_VARIANT_INDEX]
-    branch_ne t5, ARRAY_BUFFER_BYTE_BUFFER_BYTEBUFFER_INDEX, .try_typed_array_slow
-    # Load data pointer from ByteBuffer
-    # Check if ByteBuffer is using inline or outline storage
-    load8 t5, [t0, ARRAY_BUFFER_BYTE_BUFFER_INLINE]
-    branch_nonzero t5, .ta_inline_buffer
-    # Outline: load the m_outline_buffer pointer
-    load64 t5, [t0, ARRAY_BUFFER_BYTE_BUFFER_OUTLINE_POINTER]
-    jmp .ta_have_data_ptr
-.ta_inline_buffer:
-    # Inline: data is at the start of the ByteBuffer (within Variant data)
-    lea t5, [t0, ARRAY_BUFFER_BYTE_BUFFER_OFFSET]
-.ta_have_data_ptr:
-    # Add byte_offset
-    load32 t0, [t3, TYPED_ARRAY_BYTE_OFFSET]
-    add t5, t0
+    # Load cached data pointer (pre-computed: buffer.data() + byte_offset)
+    # nullptr means uncached -> C++ helper will resolve the access.
+    load64 t5, [t3, TYPED_ARRAY_CACHED_DATA_PTR]
+    branch_zero t5, .try_typed_array_slow
+    # Cached pointers only exist for fixed-length typed arrays, so array_length
+    # is known to hold a concrete u32 value here.
+    load32 t0, [t3, TYPED_ARRAY_ARRAY_LENGTH_VALUE]
+    branch_ge_unsigned t4, t0, .try_typed_array_slow
     # t5 = data base pointer, t4 = index
     # Dispatch on kind
     load8 t0, [t3, TYPED_ARRAY_KIND]
     branch_eq t0, TYPED_ARRAY_KIND_INT32, .ta_int32
-    branch_eq t0, TYPED_ARRAY_KIND_UINT8, .ta_uint8
+    branch_any_eq t0, TYPED_ARRAY_KIND_UINT8, TYPED_ARRAY_KIND_UINT8_CLAMPED, .ta_uint8
     branch_eq t0, TYPED_ARRAY_KIND_UINT16, .ta_uint16
     branch_eq t0, TYPED_ARRAY_KIND_INT8, .ta_int8
     branch_eq t0, TYPED_ARRAY_KIND_INT16, .ta_int16
     branch_eq t0, TYPED_ARRAY_KIND_UINT32, .ta_uint32
+    branch_eq t0, TYPED_ARRAY_KIND_FLOAT32, .ta_float32
     branch_eq t0, TYPED_ARRAY_KIND_FLOAT64, .ta_float64
     jmp .try_typed_array_slow
 .ta_int32:
@@ -1610,6 +1668,18 @@ handler GetByValue
     add t0, t4
     load16s t0, [t5, t0]
     jmp .ta_box_int32
+.ta_float32:
+    mov t0, t4
+    shl t0, 2
+    add t0, t5
+    loadf32 ft0, [t0, 0]
+    float_to_double ft0, ft0
+    fp_mov t1, ft0
+    mov t3, NEGATIVE_ZERO
+    branch_eq t1, t3, .ta_f64_as_double
+    double_to_int32 t0, ft0, .ta_f64_as_double
+    branch_nonzero t0, .ta_f64_as_int
+    jmp .ta_f64_as_int
 .ta_float64:
     # index * 8 for f64 elements
     mov t0, t4
@@ -1681,30 +1751,22 @@ handler GetLength
     branch_ne t0, t2, .slow
     # IC hit
     load32 t0, [t5, PROPERTY_LOOKUP_CACHE_ENTRY0_PROPERTY_OFFSET]
-    load64 t5, [t3, OBJECT_STORAGE_DATA]
+    load64 t5, [t3, OBJECT_NAMED_PROPERTIES]
     load64 t0, [t5, t0, 8]
     extract_tag t2, t0
     branch_eq t2, ACCESSOR_TAG, .slow
     store_operand m_dst, t0
     dispatch_next
 .magical_length:
-    # Object.m_indexed_properties
-    load64 t0, [t3, OBJECT_INDEXED_PROPERTIES]
-    # If storage is null, length is 0
-    branch_zero t0, .length_zero
-    # IndexedPropertyStorage.m_array_size
-    load64 t0, [t0, INDEXED_PROPERTY_STORAGE_ARRAY_SIZE]
-    # Box as int32 if fits, otherwise double
+    # Object.m_indexed_array_like_size (u32)
+    load32 t0, [t3, OBJECT_INDEXED_ARRAY_LIKE_SIZE]
+    # Box as int32 if fits (u32 always fits since bit 31 check is for sign)
     mov t2, t0
     shr t2, 31
     branch_nonzero t2, .length_double
     # Tag as int32
     box_int32 t3, t0
     store_operand m_dst, t3
-    dispatch_next
-.length_zero:
-    mov t0, INT32_TAG_SHIFTED
-    store_operand m_dst, t0
     dispatch_next
 .length_double:
     int_to_double ft0, t0
@@ -1717,9 +1779,10 @@ end
 
 # Inline cache fast path for global variable access via the global object.
 handler GetGlobal
-    # Load global_declarative_environment and global_object
-    load64 t1, [exec_ctx, EXECUTION_CONTEXT_GLOBAL_DECLARATIVE_ENVIRONMENT]
-    load64 t2, [exec_ctx, EXECUTION_CONTEXT_GLOBAL_OBJECT]
+    # Load global_declarative_environment and global_object via realm
+    load64 t0, [exec_ctx, EXECUTION_CONTEXT_REALM]
+    load64 t2, [t0, REALM_GLOBAL_OBJECT]
+    load64 t1, [t0, REALM_GLOBAL_DECLARATIVE_ENVIRONMENT]
     # Get GlobalVariableCache* (direct pointer from instruction stream)
     load64 t3, [pb, pc, m_cache]
     # Check environment_serial_number matches
@@ -1737,7 +1800,7 @@ handler GetGlobal
     branch_ne t0, t5, .try_env_binding
     # IC hit! Load property value via get_direct
     load32 t0, [t3, PROPERTY_LOOKUP_CACHE_ENTRY0_PROPERTY_OFFSET]
-    load64 t5, [t2, OBJECT_STORAGE_DATA]
+    load64 t5, [t2, OBJECT_NAMED_PROPERTIES]
     load64 t0, [t5, t0, 8]
     # Check not accessor
     extract_tag t5, t0
@@ -1774,9 +1837,10 @@ end
 
 # Inline cache fast path for global variable store via the global object.
 handler SetGlobal
-    # Load global_declarative_environment and global_object
-    load64 t1, [exec_ctx, EXECUTION_CONTEXT_GLOBAL_DECLARATIVE_ENVIRONMENT]
-    load64 t2, [exec_ctx, EXECUTION_CONTEXT_GLOBAL_OBJECT]
+    # Load global_declarative_environment and global_object via realm
+    load64 t0, [exec_ctx, EXECUTION_CONTEXT_REALM]
+    load64 t2, [t0, REALM_GLOBAL_OBJECT]
+    load64 t1, [t0, REALM_GLOBAL_DECLARATIVE_ENVIRONMENT]
     # Get GlobalVariableCache* (direct pointer from instruction stream)
     load64 t3, [pb, pc, m_cache]
     # Check environment_serial_number matches
@@ -1794,7 +1858,7 @@ handler SetGlobal
     branch_ne t0, t5, .try_env_binding
     # IC hit! Load current value to check it's not an accessor
     load32 t1, [t3, PROPERTY_LOOKUP_CACHE_ENTRY0_PROPERTY_OFFSET]
-    load64 t5, [t2, OBJECT_STORAGE_DATA]
+    load64 t5, [t2, OBJECT_NAMED_PROPERTIES]
     load64 t4, [t5, t1, 8]
     extract_tag t4, t4
     branch_eq t4, ACCESSOR_TAG, .slow
@@ -1905,7 +1969,7 @@ handler CallBuiltin
     check_is_double t1, .slow
     fp_mov ft0, t1
     fp_floor ft0, ft0
-    canonicalize_nan t5, ft0
+    box_double_or_int32 t5, ft0
     store_operand m_dst, t5
     dispatch_callbuiltin_size
 .math_ceil:
@@ -1913,7 +1977,7 @@ handler CallBuiltin
     check_is_double t1, .slow
     fp_mov ft0, t1
     fp_ceil ft0, ft0
-    canonicalize_nan t5, ft0
+    box_double_or_int32 t5, ft0
     store_operand m_dst, t5
     dispatch_callbuiltin_size
 .math_sqrt:
@@ -1921,7 +1985,7 @@ handler CallBuiltin
     check_is_double t1, .slow
     fp_mov ft0, t1
     fp_sqrt ft0, ft0
-    canonicalize_nan t5, ft0
+    box_double_or_int32 t5, ft0
     store_operand m_dst, t5
     dispatch_callbuiltin_size
 .math_exp:

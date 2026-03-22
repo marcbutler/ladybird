@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025, Tim Flynn <trflynn89@ladybird.org>
+ * Copyright (c) 2024-2026, Tim Flynn <trflynn89@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -8,9 +8,9 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Utf16View.h>
 #include <LibUnicode/ICU.h>
+#include <LibUnicode/Locale.h>
 
 #include <unicode/dtptngen.h>
-#include <unicode/gregocal.h>
 #include <unicode/locdspnm.h>
 #include <unicode/numsys.h>
 #include <unicode/tznames.h>
@@ -18,7 +18,6 @@
 namespace Unicode {
 
 static HashMap<String, OwnPtr<LocaleData>> s_locale_cache;
-static HashMap<String, OwnPtr<CalendarData>> s_calendar_cache;
 static HashMap<String, OwnPtr<TimeZoneData>> s_time_zone_cache;
 
 Optional<LocaleData&> LocaleData::for_locale(StringView locale)
@@ -47,18 +46,65 @@ LocaleData::LocaleData(icu::Locale locale)
 {
 }
 
-String LocaleData::to_string()
+String LocaleData::canonicalize(StringView locale)
 {
-    if (!m_locale_string.has_value()) {
-        UErrorCode status = U_ZERO_ERROR;
+    auto locale_data = LocaleData::for_locale(locale);
+    VERIFY(locale_data.has_value());
 
-        auto result = locale().toLanguageTag<StringBuilder>(status);
-        verify_icu_success(status);
+    if (locale_data->m_canonical_locale_string.has_value())
+        return *locale_data->m_canonical_locale_string;
 
-        m_locale_string = MUST(result.to_string());
+    UErrorCode status = U_ZERO_ERROR;
+
+    // FIXME: ICU's canonicalize() and toLanguageTag() incorrectly convert the Unicode extension value "yes" to "true"
+    //        for all keywords (and then remove "true" per UTS 35). Per CLDR BCP47 data, only specific keys define "yes"
+    //        as an alias for "true" (kb, kc, kh, kk, kn). For other keys, "yes" must be preserved. See:
+    //        https://unicode-org.atlassian.net/browse/ICU-21367
+    HashTable<ByteString> keywords_with_yes;
+
+    if (auto parsed = parse_unicode_locale_id(locale); parsed.has_value()) {
+        parsed->for_each_extension_of_type<LocaleExtension>([&](auto const& extension) {
+            for (auto const& keyword : extension.keywords) {
+                if (!keyword.value.equals_ignoring_ascii_case("yes"sv))
+                    continue;
+
+                auto key = keyword.key.to_ascii_lowercase().to_byte_string();
+
+                if (auto const* legacy_key = uloc_toLegacyKey(key.characters())) {
+                    if (auto const* value = uloc_toUnicodeLocaleType(legacy_key, "yes"); !value || value != "true"sv)
+                        keywords_with_yes.set(move(key));
+                }
+            }
+
+            return IterationDecision::Continue;
+        });
     }
 
-    return *m_locale_string;
+    locale_data->locale().canonicalize(status);
+    verify_icu_success(status);
+
+    auto result = locale_data->locale().toLanguageTag<StringBuilder>(status);
+    verify_icu_success(status);
+
+    if (keywords_with_yes.is_empty()) {
+        locale_data->m_canonical_locale_string = MUST(result.to_string());
+    } else {
+        auto parsed = parse_unicode_locale_id(result.string_view());
+        VERIFY(parsed.has_value());
+
+        parsed->for_each_extension_of_type<LocaleExtension>([&](auto& extension) {
+            for (auto& keyword : extension.keywords) {
+                if (keyword.value.is_empty() && keywords_with_yes.contains(keyword.key.bytes_as_string_view()))
+                    keyword.value = "yes"_string;
+            }
+
+            return IterationDecision::Continue;
+        });
+
+        locale_data->m_canonical_locale_string = parsed->to_string();
+    }
+
+    return *locale_data->m_canonical_locale_string;
 }
 
 icu::LocaleDisplayNames& LocaleData::standard_display_names()
@@ -114,53 +160,6 @@ icu::TimeZoneNames& LocaleData::time_zone_names()
     }
 
     return *m_time_zone_names;
-}
-
-Optional<CalendarData&> CalendarData::for_calendar(String const& calendar)
-{
-    auto& calendar_data = s_calendar_cache.ensure(calendar, [&]() -> OwnPtr<CalendarData> {
-        UErrorCode status = U_ZERO_ERROR;
-
-        auto const* legacy_calendar = uloc_toLegacyType("calendar", ByteString(calendar).characters());
-        if (!legacy_calendar)
-            return nullptr;
-
-        auto locale_data = LocaleData::for_locale("und"sv);
-        VERIFY(locale_data.has_value());
-
-        locale_data->locale().setKeywordValue("calendar", legacy_calendar, status);
-        if (icu_failure(status))
-            return nullptr;
-
-        auto icu_calendar = adopt_own_if_nonnull(icu::Calendar::createInstance(locale_data->locale(), status));
-        if (icu_failure(status))
-            return nullptr;
-
-        return adopt_own(*new CalendarData { icu_calendar.release_nonnull() });
-    });
-
-    if (calendar_data)
-        return *calendar_data;
-    return {};
-}
-
-void CalendarData::adjust_time_range_for_proleptic_calendar(icu::Calendar& icu_calendar)
-{
-    // https://tc39.es/ecma262/#sec-time-values-and-time-range
-    // A time value supports a slightly smaller range of -8,640,000,000,000,000 to 8,640,000,000,000,000 milliseconds.
-    static constexpr UDate ECMA_262_MINIMUM_TIME = -8.64E15;
-    UErrorCode status = U_ZERO_ERROR;
-
-    if (auto* gregorian_calendar = as_if<icu::GregorianCalendar>(icu_calendar)) {
-        gregorian_calendar->setGregorianChange(ECMA_262_MINIMUM_TIME, status);
-        verify_icu_success(status);
-    }
-}
-
-CalendarData::CalendarData(NonnullOwnPtr<icu::Calendar> calendar)
-    : m_calendar(move(calendar))
-{
-    adjust_time_range_for_proleptic_calendar(*m_calendar);
 }
 
 Optional<TimeZoneData&> TimeZoneData::for_time_zone(StringView time_zone)

@@ -1,21 +1,15 @@
 include(libjs_generators)
 
 set(SOURCES
-    AST.cpp
-    ASTDump.cpp
     Bytecode/AsmInterpreter/AsmInterpreter.cpp
-    Bytecode/ASTCodegen.cpp
     Bytecode/BasicBlock.cpp
-    Bytecode/Builtins.cpp
     Bytecode/Executable.cpp
-    Bytecode/Generator.cpp
     Bytecode/IdentifierTable.cpp
     Bytecode/Instruction.cpp
     Bytecode/Interpreter.cpp
     Bytecode/Label.cpp
     Bytecode/PropertyKeyTable.cpp
     Bytecode/RegexTable.cpp
-    Bytecode/ScopedOperand.cpp
     Bytecode/StringTable.cpp
     Console.cpp
     Contrib/Test262/262Object.cpp
@@ -24,11 +18,8 @@ set(SOURCES
     Contrib/Test262/IsHTMLDDA.cpp
     CyclicModule.cpp
     Heap/Cell.cpp
-    Lexer.cpp
     Module.cpp
-    Parser.cpp
     ParserError.cpp
-    PipelineComparison.cpp
     Print.cpp
     RustIntegration.cpp
     Runtime/AbstractOperations.cpp
@@ -103,7 +94,6 @@ set(SOURCES
     Runtime/GeneratorFunctionPrototype.cpp
     Runtime/GeneratorObject.cpp
     Runtime/GeneratorPrototype.cpp
-    Runtime/GeneratorResult.cpp
     Runtime/GlobalEnvironment.cpp
     Runtime/GlobalObject.cpp
     Runtime/IndexedProperties.cpp
@@ -268,13 +258,11 @@ set(SOURCES
     Runtime/WeakSetPrototype.cpp
     Runtime/WrapForValidIteratorPrototype.cpp
     Runtime/WrappedFunction.cpp
-    ScopeCollector.cpp
     Script.cpp
     SourceCode.cpp
     SourceTextModule.cpp
     SyntaxHighlighter.cpp
     SyntheticModule.cpp
-    Token.cpp
 )
 
 generate_bytecode_def_derived()
@@ -307,18 +295,16 @@ endif()
 target_link_libraries(LibJS PUBLIC JSClangPlugin)
 
 if (ENABLE_RUST)
-    corrosion_import_crate(MANIFEST_PATH Rust/Cargo.toml)
+    import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libjs_rust)
     target_link_libraries(LibJS PRIVATE libjs_rust)
     target_compile_definitions(LibJS PRIVATE ENABLE_RUST)
-    install(TARGETS libjs_rust EXPORT LagomTargets
-        ARCHIVE COMPONENT Lagom_Development
-    )
+
     # The Rust library and LibJS have a circular dependency (C++ calls Rust
     # entry points, Rust calls C++ callbacks). For static builds, merge the
     # Rust archive into the LibJS archive so all symbols are in one place.
     if(NOT BUILD_SHARED_LIBS)
         add_custom_command(TARGET LibJS POST_BUILD
-            COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libjs_rust-static>
+            COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libjs_rust>
             COMMAND ${CMAKE_AR} -qS $<TARGET_FILE:LibJS> *.o
             COMMAND ${CMAKE_RANLIB} $<TARGET_FILE:LibJS>
             COMMAND ${CMAKE_COMMAND} -E remove -f *.o

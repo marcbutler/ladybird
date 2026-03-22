@@ -27,16 +27,16 @@ public:
     ~Interpreter();
 
     [[nodiscard]] Realm& realm() { return *m_running_execution_context->realm; }
-    [[nodiscard]] Object& global_object() { return *m_running_execution_context->global_object; }
-    [[nodiscard]] DeclarativeEnvironment& global_declarative_environment() { return *m_running_execution_context->global_declarative_environment; }
+    [[nodiscard]] Object& global_object() { return realm().global_object(); }
+    [[nodiscard]] DeclarativeEnvironment& global_declarative_environment();
     static VM& vm() { return VM::the(); }
 
     ThrowCompletionOr<Value> run(Script&, GC::Ptr<Environment> lexical_environment_override = nullptr);
     ThrowCompletionOr<Value> run(SourceTextModule&);
 
-    ThrowCompletionOr<Value> run_executable(ExecutionContext&, Executable&, Optional<size_t> entry_point);
+    ThrowCompletionOr<Value> run_executable(ExecutionContext&, Executable&, u32 entry_point = 0);
 
-    ThrowCompletionOr<Value> run_executable(ExecutionContext& context, Executable& executable, Optional<size_t> entry_point, Value initial_accumulator_value)
+    ThrowCompletionOr<Value> run_executable(ExecutionContext& context, Executable& executable, u32 entry_point, Value initial_accumulator_value)
     {
         context.registers_and_constants_and_locals_and_arguments_span()[0] = initial_accumulator_value;
         return run_executable(context, executable, entry_point);
@@ -115,8 +115,5 @@ private:
 };
 
 JS_API extern bool g_dump_bytecode;
-
-GC::Ref<Bytecode::Executable> compile(VM&, ASTNode const&, JS::FunctionKind kind, Utf16FlyString const& name);
-GC::Ref<Bytecode::Executable> compile(VM&, GC::Ref<SharedFunctionInstanceData const>, BuiltinAbstractOperationsEnabled builtin_abstract_operations_enabled);
 
 }

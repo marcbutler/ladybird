@@ -47,6 +47,7 @@ use crate::ast::*;
 use crate::lexer::ch;
 use crate::u32_from_usize;
 
+use super::ffi::{LiteralValueKind, WellKnownSymbolKind};
 use super::generator::{
     BlockBoundaryType, ConstantValue, FinallyContext, Generator, ScopedOperand, choose_dst,
     constant_to_boolean, parse_bigint,
@@ -119,7 +120,9 @@ fn generate_expression_inner(
         }
 
         // === Identifiers ===
-        ExpressionKind::Identifier(ident) => generate_identifier(ident, generator, preferred_dst),
+        ExpressionKind::Identifier(ident) => {
+            Some(generate_identifier(ident, generator, preferred_dst))
+        }
 
         // === This ===
         ExpressionKind::This => {
@@ -166,14 +169,18 @@ fn generate_expression_inner(
         }
 
         // === Function expressions ===
-        ExpressionKind::Function(function_id) => {
-            generate_function_expression(generator, *function_id, preferred_dst)
-        }
+        ExpressionKind::Function(function_id) => Some(generate_function_expression(
+            generator,
+            *function_id,
+            preferred_dst,
+        )),
 
         // === Array ===
-        ExpressionKind::Array(elements) => {
-            generate_array_expression(generator, elements, preferred_dst)
-        }
+        ExpressionKind::Array(elements) => Some(generate_array_expression(
+            generator,
+            elements,
+            preferred_dst,
+        )),
 
         // === Member access ===
         ExpressionKind::Member {
@@ -204,13 +211,16 @@ fn generate_expression_inner(
         ExpressionKind::Yield {
             argument,
             is_yield_from,
-        } => generate_yield_expression(generator, argument.as_deref(), *is_yield_from),
+        } => Some(generate_yield_expression(
+            generator,
+            argument.as_deref(),
+            *is_yield_from,
+        )),
 
         // === Await ===
         ExpressionKind::Await(inner) => {
             let value = generate_expression_or_undefined(inner, generator, None);
-            // Match C++ AwaitExpression::generate_bytecode which allocates
-            // received_completion registers before the await.
+            // Allocate received_completion registers before the await.
             let received_completion = generator.allocate_register();
             let received_completion_type = generator.allocate_register();
             let received_completion_value = generator.allocate_register();
@@ -275,15 +285,21 @@ fn generate_expression_inner(
         ExpressionKind::TaggedTemplateLiteral {
             tag,
             template_literal,
-        } => generate_tagged_template_literal(generator, tag, template_literal, preferred_dst),
+        } => Some(generate_tagged_template_literal(
+            generator,
+            tag,
+            template_literal,
+            preferred_dst,
+        )),
 
         // === Object ===
-        ExpressionKind::Object(data) => generate_object_expression(generator, data, preferred_dst),
+        ExpressionKind::Object(data) => {
+            Some(generate_object_expression(generator, data, preferred_dst))
+        }
 
         // === OptionalChain ===
         ExpressionKind::OptionalChain { base, references } => {
-            // Match C++ OptionalChain::generate_bytecode: allocate current_base
-            // first, current_value second.
+            // Allocate current_base first, current_value second.
             let current_base = generator.allocate_register();
             let current_value = choose_dst(generator, preferred_dst);
             let undef = generator.add_constant_undefined();
@@ -326,7 +342,9 @@ fn generate_expression_inner(
             Some(dst)
         }
 
-        ExpressionKind::Class(data) => generate_class_expression(generator, data, preferred_dst),
+        ExpressionKind::Class(data) => {
+            Some(generate_class_expression(generator, data, preferred_dst))
+        }
 
         ExpressionKind::PrivateIdentifier(_) => {
             // Private identifiers are handled by member access codegen
@@ -345,7 +363,7 @@ fn generate_unary_expression(
 ) -> Option<ScopedOperand> {
     // typeof and delete on identifiers need special handling BEFORE
     // evaluating the operand to avoid throwing on unresolvable references.
-    // C++ allocates dst before evaluating typeof/not operands.
+    // Allocate dst before evaluating typeof/not operands.
     if op == UnaryOp::Typeof {
         if let ExpressionKind::Identifier(ident) = &operand.inner
             && !ident.is_local()
@@ -371,7 +389,7 @@ fn generate_unary_expression(
         return Some(emit_delete_reference(generator, operand));
     }
 
-    // Not needs dst allocated before operand to match C++ register order.
+    // Allocate dst before operand.
     // Also optimize !!x -> ToBoolean(x).
     if op == UnaryOp::Not {
         let dst = choose_dst(generator, preferred_dst);
@@ -485,7 +503,7 @@ fn generate_binary_expression(
         return Some(dst);
     }
     // OPTIMIZATION: Pre-convert numeric literal operands of bitwise
-    // operations to i32/u32 to avoid runtime conversion (matches C++).
+    // operations to i32/u32 to avoid runtime conversion.
     let lhs_val = match op {
         BinaryOp::BitwiseAnd
         | BinaryOp::BitwiseOr
@@ -544,14 +562,13 @@ fn generate_function_expression(
     generator: &mut Generator,
     function_id: FunctionId,
     preferred_dst: Option<&ScopedOperand>,
-) -> Option<ScopedOperand> {
+) -> ScopedOperand {
     let data = generator.function_table.take(function_id);
     let has_name = data.name.is_some();
-    let mut name_id = None;
 
     // Named function expressions get an intermediate scope so the name
     // is visible inside the function body but not outside.
-    if has_name {
+    let name_id = if has_name {
         let parent = generator
             .lexical_environment_register_stack
             .last()
@@ -580,8 +597,10 @@ fn generate_function_expression(
             is_global: false,
             is_strict: false,
         });
-        name_id = Some(id);
-    }
+        Some(id)
+    } else {
+        None
+    };
 
     let dst = choose_dst(generator, preferred_dst);
     // For anonymous function expressions, use the pending LHS name
@@ -616,14 +635,14 @@ fn generate_function_expression(
 
         generator.end_variable_scope();
     }
-    Some(dst)
+    dst
 }
 
 fn generate_array_expression(
     generator: &mut Generator,
     elements: &[Option<Expression>],
     preferred_dst: Option<&ScopedOperand>,
-) -> Option<ScopedOperand> {
+) -> ScopedOperand {
     // If all elements are constant primitives, emit NewPrimitiveArray.
     if !elements.is_empty()
         && elements.iter().all(|e| match e {
@@ -654,7 +673,7 @@ fn generate_array_expression(
             element_count: u32_from_usize(values.len()),
             elements: values,
         });
-        return Some(dst);
+        return dst;
     }
 
     // Find the first spread element.
@@ -685,7 +704,7 @@ fn generate_array_expression(
     });
 
     // NB: Keep scoped_arguments alive until the end of the expression
-    // to match C++ register lifetime behavior.
+    // so their registers aren't reused during spread evaluation.
 
     // Append elements after the first spread using ArrayAppend.
     if let Some(spread_index) = first_spread {
@@ -712,7 +731,7 @@ fn generate_array_expression(
         }
     }
 
-    Some(dst)
+    dst
 }
 
 fn generate_member_expression(
@@ -774,9 +793,8 @@ fn generate_yield_expression(
     generator: &mut Generator,
     argument: Option<&Expression>,
     is_yield_from: bool,
-) -> Option<ScopedOperand> {
-    // Match C++ YieldExpression::generate_bytecode: allocate
-    // completion registers before evaluating the argument.
+) -> ScopedOperand {
+    // Allocate completion registers before evaluating the argument.
     let received_completion = generator.allocate_register();
     let received_completion_type = generator.allocate_register();
     let received_completion_value = generator.allocate_register();
@@ -788,17 +806,17 @@ fn generate_yield_expression(
     };
 
     if is_yield_from {
-        return Some(generate_yield_from(
+        return generate_yield_from(
             generator,
             value,
             &received_completion,
             &received_completion_type,
             &received_completion_value,
-        ));
+        );
     }
 
-    // Match C++ YieldExpression::generate_bytecode: create continuation
-    // block, call generate_yield, then handle completion checking.
+    // Create continuation block, call generate_yield, then handle
+    // completion checking.
     let continuation_block = generator.make_block();
     let is_in_finalizer = generator.is_in_finalizer();
 
@@ -871,7 +889,7 @@ fn generate_yield_expression(
     generator.generate_return(&received_completion_value);
 
     generator.switch_to_basic_block(normal_block);
-    Some(received_completion_value)
+    received_completion_value
 }
 
 /// Generate bytecode for an expression, returning `undefined` if the
@@ -973,7 +991,7 @@ pub fn generate_statement(
                 Some(expression) => {
                     let v = generate_expression_or_undefined(expression, generator, None);
                     // Async functions implicitly await an explicit return value.
-                    // Bare `return;` does NOT await (matches C++ and spec).
+                    // Bare `return;` does NOT await (per spec).
                     if generator.is_in_async_function() {
                         let received_completion = generator.allocate_register();
                         let received_completion_type = generator.allocate_register();
@@ -1111,21 +1129,20 @@ pub fn generate_statement(
             // Bind the class name in the outer scope (classes are lexically scoped).
             // Use InitializeLexicalBinding since the name starts in the TDZ
             // (temporal dead zone) until this point, matching `let` semantics.
-            // NB: We do NOT mark the local as initialized here, matching C++
-            // emit_set_variable(Initialize) behavior. This preserves TDZ checks
-            // for subsequent uses of the class name.
-            if let (Some(name_ident), Some(val)) = (&data.name, &value) {
+            // NB: We do NOT mark the local as initialized here, preserving
+            // TDZ checks for subsequent uses of the class name.
+            if let Some(name_ident) = &data.name {
                 if name_ident.is_local() {
                     let local = generator.resolve_local(
                         name_ident.local_index.get(),
                         name_ident.local_type.get().unwrap(),
                     );
-                    generator.emit_mov(&local, val);
+                    generator.emit_mov(&local, &value);
                 } else {
                     let id = generator.intern_identifier(&name_ident.name);
                     generator.emit(Instruction::InitializeLexicalBinding {
                         identifier: id,
-                        src: val.operand(),
+                        src: value.operand(),
                         cache: EnvironmentCoordinate::empty(),
                     });
                 }
@@ -1247,18 +1264,6 @@ enum ClassElementKind {
 enum IteratorHint {
     Sync = 0,
     Async = 1,
-}
-
-/// Literal value kind for class field initializers
-/// (ABI-compatible with BytecodeFactory).
-#[repr(u8)]
-enum LiteralValueKind {
-    None = 0,
-    Number = 1,
-    BooleanTrue = 2,
-    BooleanFalse = 3,
-    Null = 4,
-    String = 5,
 }
 
 /// Like generate_await but uses caller-provided completion registers.
@@ -1759,7 +1764,7 @@ fn generate_yield_from(
     return_value
 }
 
-/// Unified yield function matching C++ generate_yield().
+/// Unified yield function.
 ///
 /// For non-async generators: just emits a Yield instruction.
 /// For async generators: optionally awaits the argument first, then yields,
@@ -1868,14 +1873,13 @@ fn generate_identifier(
     ident: &Identifier,
     generator: &mut Generator,
     preferred_dst: Option<&ScopedOperand>,
-) -> Option<ScopedOperand> {
+) -> ScopedOperand {
     if ident.is_local() {
         let local_index = ident.local_index.get();
         let local = generator.resolve_local(local_index, ident.local_type.get().unwrap());
         // Check TDZ for uninitialized bindings.
         // Arguments may need TDZ during default parameter evaluation;
         // for variable-type locals, only lexically-declared (let/const) need TDZ.
-        // Matching C++ Identifier::generate_bytecode.
         let needs_tdz_check = if ident.local_type.get() == Some(LocalType::Argument) {
             !generator.is_argument_initialized(local_index)
         } else {
@@ -1894,14 +1898,14 @@ fn generate_identifier(
                 src: local.operand(),
             });
         }
-        return Some(local);
+        return local;
     }
 
     // OPTIMIZATION: Generate builtin constants (undefined, NaN, Infinity) directly.
     if ident.is_global.get()
         && let Some(constant) = maybe_generate_builtin_constant(generator, &ident.name)
     {
-        return Some(constant);
+        return constant;
     }
 
     let dst = choose_dst(generator, preferred_dst);
@@ -1928,7 +1932,7 @@ fn generate_identifier(
             cache: EnvironmentCoordinate::empty(),
         });
     }
-    Some(dst)
+    dst
 }
 
 fn maybe_generate_builtin_constant(
@@ -2041,7 +2045,7 @@ fn emit_binary_op(
             rhs: rhs_op,
         }),
         BinaryOp::BitwiseOr => {
-            // OPTIMIZATION: x | 0 == ToInt32(x) (matches C++)
+            // OPTIMIZATION: x | 0 == ToInt32(x)
             if let Some(ConstantValue::Number(n)) = generator.get_constant(rhs) {
                 if *n == 0.0 && n.is_sign_positive() {
                     generator.emit(Instruction::ToInt32 {
@@ -2073,11 +2077,29 @@ fn emit_binary_op(
             lhs: lhs_op,
             rhs: rhs_op,
         }),
-        BinaryOp::RightShift => generator.emit(Instruction::RightShift {
-            dst: dst_op,
-            lhs: lhs_op,
-            rhs: rhs_op,
-        }),
+        BinaryOp::RightShift => {
+            // OPTIMIZATION: x >> 0 == ToInt32(x) (matches C++)
+            if let Some(ConstantValue::Number(n)) = generator.get_constant(rhs) {
+                if *n == 0.0 && n.is_sign_positive() {
+                    generator.emit(Instruction::ToInt32 {
+                        dst: dst_op,
+                        value: lhs_op,
+                    });
+                } else {
+                    generator.emit(Instruction::RightShift {
+                        dst: dst_op,
+                        lhs: lhs_op,
+                        rhs: rhs_op,
+                    });
+                }
+            } else {
+                generator.emit(Instruction::RightShift {
+                    dst: dst_op,
+                    lhs: lhs_op,
+                    rhs: rhs_op,
+                });
+            }
+        }
         BinaryOp::UnsignedRightShift => generator.emit(Instruction::UnsignedRightShift {
             dst: dst_op,
             lhs: lhs_op,
@@ -2228,7 +2250,7 @@ fn generate_conditional(
 fn generate_with_completion(
     body: &Statement,
     generator: &mut Generator,
-    completion: &Option<ScopedOperand>,
+    completion: Option<&ScopedOperand>,
     preferred_dst: Option<&ScopedOperand>,
 ) -> Option<ScopedOperand> {
     let saved = generator.current_completion_register.clone();
@@ -2272,12 +2294,12 @@ fn generate_if_statement(
         && let Some(is_truthy) = constant_to_boolean(constant)
     {
         // Pass the completion register as preferred_dst so nested
-        // if-statements reuse the same register (matching C++).
+        // if-statements reuse the same register.
         let child_dst = completion.as_ref().or(preferred_dst);
         if is_truthy {
-            generate_with_completion(consequent, generator, &completion, child_dst);
+            generate_with_completion(consequent, generator, completion.as_ref(), child_dst);
         } else if let Some(alt) = alternate {
-            generate_with_completion(alt, generator, &completion, child_dst);
+            generate_with_completion(alt, generator, completion.as_ref(), child_dst);
         }
         return completion;
     }
@@ -2294,24 +2316,24 @@ fn generate_if_statement(
     generator.emit_jump_if(&pred, true_block, false_block);
 
     // Pass completion as preferred_dst to children so nested if-else chains
-    // reuse the same completion register, matching C++ behavior.
+    // reuse the same completion register.
     let child_preferred_dst = completion.as_ref();
 
     // Consequent
-    generator.switch_to_basic_block(true_block);
     let saved_completion = generator.current_completion_register.clone();
-    if let Some(ref c) = completion {
-        generator.current_completion_register = Some(c.clone());
-    }
-    let cons_result = generate_statement(consequent, generator, child_preferred_dst);
-    if !generator.is_current_block_terminated() {
-        if let (Some(c), Some(val)) = (&completion, &cons_result) {
-            generator.emit_mov(c, val);
+    {
+        generator.switch_to_basic_block(true_block);
+        if let Some(ref c) = completion {
+            generator.current_completion_register = Some(c.clone());
         }
-        generator.emit(Instruction::Jump { target: end_block });
+        let cons_result = generate_statement(consequent, generator, child_preferred_dst);
+        if !generator.is_current_block_terminated() {
+            if let (Some(c), Some(val)) = (&completion, &cons_result) {
+                generator.emit_mov(c, val);
+            }
+            generator.emit(Instruction::Jump { target: end_block });
+        }
     }
-    // FIXME: Remove this manual drop() when we no longer need to match C++ register allocation.
-    drop(cons_result);
     generator.current_completion_register = saved_completion.clone();
 
     // Alternate
@@ -2370,7 +2392,7 @@ fn generate_while_statement(
     generator.begin_continuable_scope(test_block, labels.clone(), completion.clone());
     generator.begin_breakable_scope(end_block, labels, completion.clone());
 
-    generate_with_completion(body, generator, &completion, preferred_dst);
+    generate_with_completion(body, generator, completion.as_ref(), preferred_dst);
 
     generator.end_breakable_scope();
     generator.end_continuable_scope();
@@ -2401,19 +2423,19 @@ fn generate_do_while_statement(
 
     generator.emit(Instruction::Jump { target: body_block });
 
-    // Generate test FIRST, matching C++ which keeps the test ScopedOperand
-    // alive during body generation, consuming a register from the free pool.
+    // Generate test FIRST, keeping the test ScopedOperand alive during
+    // body generation, consuming a register from the free pool.
     generator.switch_to_basic_block(test_block);
     let test_val = generate_expression_or_undefined(test, generator, None);
     generator.emit_jump_if(&test_val, body_block, load_result_and_jump_to_end_block);
 
-    // Generate body SECOND (test_val still alive, matching C++ register allocation).
+    // Generate body SECOND (test_val still alive).
     generator.switch_to_basic_block(body_block);
     let labels = std::mem::take(&mut generator.pending_labels);
     generator.begin_continuable_scope(test_block, labels.clone(), completion.clone());
     generator.begin_breakable_scope(end_block, labels, completion.clone());
 
-    generate_with_completion(body, generator, &completion, preferred_dst);
+    generate_with_completion(body, generator, completion.as_ref(), preferred_dst);
 
     generator.end_breakable_scope();
     generator.end_continuable_scope();
@@ -2492,7 +2514,7 @@ fn generate_for_statement(
     // CreatePerIterationEnvironment after init (first iteration setup).
     emit_per_iteration_bindings(generator, &per_iteration_binding_names);
 
-    // Block creation order matches C++: body → update (if exists) → test (if exists) → end.
+    // Block creation order: body → update (if exists) → test (if exists) → end.
     // If 'test' is missing, fuse 'test' and 'body' blocks.
     // If 'update' is missing, fuse 'body' and 'update' blocks.
     let body_block = generator.make_block();
@@ -2557,7 +2579,7 @@ fn generate_for_statement(
     generator.begin_continuable_scope(continue_target, labels.clone(), completion.clone());
     generator.begin_breakable_scope(end_block, labels, completion.clone());
 
-    generate_with_completion(body, generator, &completion, preferred_dst);
+    generate_with_completion(body, generator, completion.as_ref(), preferred_dst);
 
     generator.end_breakable_scope();
     generator.end_continuable_scope();
@@ -2663,9 +2685,9 @@ fn generate_scope_children(
             }
         }
         // NB: When must_propagate_completion is false, we intentionally do NOT
-        // accumulate results into last_result. This matches C++ behavior where
-        // `result` goes out of scope at the end of each loop iteration, freeing
-        // any temporary registers immediately.
+        // accumulate results into last_result. `result` goes out of scope at
+        // the end of each loop iteration, freeing any temporary registers
+        // immediately.
         if generator.is_current_block_terminated() {
             break;
         }
@@ -2689,7 +2711,7 @@ fn generate_block_statement(
     // (via close_for_loop_scope). When the block doesn't create a lexical
     // environment and its only child is a for-loop variant, skip
     // generate_scope_children and generate the child directly to avoid
-    // emitting a redundant completion Mov that C++ doesn't produce.
+    // emitting a redundant completion Mov.
     let result = if !did_create_env && scope.children.len() == 1 && is_for_loop(&scope.children[0])
     {
         generate_statement(&scope.children[0], generator, preferred_dst)
@@ -3125,11 +3147,18 @@ fn try_generate_builtin_constant(
         return None;
     }
     if *name == utf16!("SYMBOL_ITERATOR") {
-        let value = unsafe { super::ffi::get_well_known_symbol(generator.vm_ptr, 0) };
+        let value = unsafe {
+            super::ffi::get_well_known_symbol(generator.vm_ptr, WellKnownSymbolKind::SymbolIterator)
+        };
         return Some(generator.add_constant_raw_value(value));
     }
     if *name == utf16!("SYMBOL_ASYNC_ITERATOR") {
-        let value = unsafe { super::ffi::get_well_known_symbol(generator.vm_ptr, 1) };
+        let value = unsafe {
+            super::ffi::get_well_known_symbol(
+                generator.vm_ptr,
+                WellKnownSymbolKind::SymbolAsyncIterator,
+            )
+        };
         return Some(generator.add_constant_raw_value(value));
     }
     if *name == utf16!("MAX_ARRAY_LIKE_INDEX") {
@@ -3186,7 +3215,7 @@ fn generate_call_expression(
                 computed,
             } if matches!(object.inner, ExpressionKind::Super) => {
                 // Super member call: super.method() or super[expr]()
-                // Must match C++ evaluation order:
+                // Spec evaluation order:
                 // 1. ResolveThisBinding
                 // 2. Evaluate computed property (if any)
                 // 3. ResolveSuperBase
@@ -3240,7 +3269,7 @@ fn generate_call_expression(
             }
             ExpressionKind::Identifier(ident) if ident.is_local() => {
                 // Local identifier: use the local directly, with ThrowIfTDZ
-                // if not yet initialized (matching C++ CallExpression codegen).
+                // if not yet initialized.
                 let local = generator
                     .resolve_local(ident.local_index.get(), ident.local_type.get().unwrap());
                 let needs_tdz = if ident.local_type.get() == Some(LocalType::Argument) {
@@ -3271,9 +3300,8 @@ fn generate_call_expression(
                 (callee_reg, Some(this_reg))
             }
             ExpressionKind::OptionalChain { base, references } => {
-                // Match C++ CallExpression::generate_bytecode: allocate callee
-                // (current_value) first, this_value (current_base) second,
-                // and do NOT emit Mov Undefined for current_base.
+                // Allocate callee (current_value) first, this_value
+                // (current_base) second.
                 let callee = generator.allocate_register();
                 let this_value = generator.allocate_register();
                 generate_optional_chain_inner(generator, base, references, &callee, &this_value)?;
@@ -3327,9 +3355,6 @@ fn generate_call_expression(
                 is_spread: argument.is_spread,
             });
         }
-        // FIXME: Remove this manual drop() when we no longer need to match C++ register allocation.
-        drop(pre_holders);
-
         if is_new {
             generator.emit(Instruction::CallConstructWithArgumentArray {
                 dst: dst.operand(),
@@ -3442,7 +3467,7 @@ fn emit_update_op(
         }
         value.clone()
     } else {
-        // Always allocate a fresh register for the old value, matching C++.
+        // Always allocate a fresh register for the old value.
         let dst = generator.allocate_register();
         match op {
             UpdateOp::Increment => generator.emit(Instruction::PostfixIncrement {
@@ -3468,7 +3493,7 @@ fn generate_update_expression(
     // so we can store back without re-evaluating.
     match &argument.inner {
         ExpressionKind::Identifier(ident) => {
-            let value = generate_identifier(ident, generator, None)?;
+            let value = generate_identifier(ident, generator, None);
             let result = emit_update_op(generator, op, prefixed, &value);
             emit_set_variable(generator, ident, &value);
             Some(result)
@@ -3521,17 +3546,8 @@ fn generate_update_expression(
                     let property = generate_expression(property, generator, None)?;
                     let value = generator.allocate_register();
                     emit_get_by_value(generator, &value, &base, &property, base_id);
-                    // Save property for store-back (matching C++ emit_load_from_reference).
-                    let saved_property = generator.allocate_register();
-                    generator.emit_mov(&saved_property, &property);
-                    // FIXME: Remove these manual drop() calls when we no longer need to match C++ register allocation.
-                    drop(property);
                     let result = emit_update_op(generator, op, prefixed, &value);
-                    emit_put_normal_by_value(generator, &base, &saved_property, &value, None);
-                    // FIXME: Remove this manual drop() when we no longer need to match C++ register allocation.
-                    if !prefixed {
-                        drop(value);
-                    }
+                    emit_put_normal_by_value(generator, &base, &property, &value, None);
                     Some(result)
                 } else if let ExpressionKind::Identifier(property_ident) = &property.inner {
                     let value = generator.allocate_register();
@@ -3612,7 +3628,7 @@ fn generate_assignment_expression(
                 }
 
                 // Load LHS value first (needed for both compound and logical assignments).
-                let lhs_val = generate_identifier(ident, generator, None)?;
+                let lhs_val = generate_identifier(ident, generator, None);
                 let lhs_val = generator.copy_if_needed_to_preserve_evaluation_order(&lhs_val);
 
                 let is_logical = matches!(
@@ -3647,7 +3663,7 @@ fn generate_assignment_expression(
                     generator.pending_lhs_name = Some(generator.intern_identifier(&ident.name));
                     let rhs_val = generate_expression(rhs, generator, None)?;
                     generator.pending_lhs_name = None;
-                    // Allocate dst after RHS evaluation to match C++ register order.
+                    // Allocate dst after RHS evaluation.
                     let dst = if lhs_val.operand().is_local() {
                         lhs_val.clone()
                     } else {
@@ -3826,11 +3842,11 @@ fn generate_assignment_expression(
                     let property = generate_expression(property, generator, None)?;
                     let old_val = generator.allocate_register();
                     emit_get_by_value(generator, &old_val, &base, &property, base_id);
-                    // Save property for store-back (matching C++ emit_load_from_reference).
+                    // Copy property to a fresh register so RHS evaluation
+                    // (which may mutate the variable backing property) doesn't
+                    // affect the store-back index.
                     let saved_property = generator.allocate_register();
                     generator.emit_mov(&saved_property, &property);
-                    // FIXME: Remove this manual drop() when we no longer need to match C++ register allocation.
-                    drop(property);
                     if is_logical {
                         let rhs_block = generator.make_block();
                         let lhs_block = generator.make_block();
@@ -3846,20 +3862,12 @@ fn generate_assignment_expression(
                         generator.emit_mov(&dst, &old_val);
                         generator.emit(Instruction::Jump { target: end_block });
                         generator.switch_to_basic_block(end_block);
-                        // FIXME: Remove these manual drop() calls when we no longer need to match C++ register allocation.
-                        drop(rhs_val);
-                        drop(old_val);
-                        drop(saved_property);
                         return Some(dst);
                     }
                     let rhs_val = generate_expression(rhs, generator, None)?;
                     let dst = choose_dst(generator, preferred_dst);
                     emit_compound_assignment(generator, op, &dst, &old_val, &rhs_val);
                     emit_put_normal_by_value(generator, &base, &saved_property, &dst, None);
-                    // FIXME: Remove these manual drop() calls when we no longer need to match C++ register allocation.
-                    drop(rhs_val);
-                    drop(old_val);
-                    drop(saved_property);
                     return Some(dst);
                 } else if let ExpressionKind::Identifier(ident) = &property.inner {
                     let old_val = generator.allocate_register();
@@ -3919,7 +3927,7 @@ fn generate_assignment_expression(
                         emit_logical_jump(generator, op, &old_val, rhs_block, lhs_block);
                         generator.switch_to_basic_block(rhs_block);
                         let rhs_val = generate_expression(rhs, generator, None)?;
-                        // Allocate dst after RHS evaluation to match C++ register order.
+                        // Allocate dst after RHS evaluation.
                         let dst = choose_dst(generator, preferred_dst);
                         generator.emit_mov(&dst, &rhs_val);
                         let id2 = generator.intern_identifier(&priv_ident.name);
@@ -4117,7 +4125,7 @@ fn emit_invalid_lhs_error(generator: &mut Generator) {
 }
 
 /// Check if a UTF-16 string is a canonical array index (non-negative integer < 2^32 - 1).
-/// Matches the behavior of C++ to_property_key: these strings become integer PropertyKeys,
+/// These strings become integer PropertyKeys,
 /// not string PropertyKeys, so they must NOT be optimized to GetById/PutById.
 pub(crate) fn is_array_index(s: &[u16]) -> bool {
     if s.is_empty() || s.len() > 10 {
@@ -4352,8 +4360,8 @@ fn emit_put_by_value(
     }
 }
 
-/// Emit a ThrowIfTDZ check for a local identifier if needed, matching C++
-/// Generator::emit_tdz_check_if_needed. This is used before assigning to a
+/// Emit a ThrowIfTDZ check for a local identifier if needed. This is used
+/// before assigning to a
 /// variable to ensure TDZ semantics for let/const bindings.
 fn emit_tdz_check_if_needed(generator: &mut Generator, ident: &Identifier) {
     if !ident.is_local() {
@@ -4382,13 +4390,13 @@ fn emit_set_variable(generator: &mut Generator, ident: &Identifier, value: &Scop
     if ident.is_local() {
         if ident.declaration_kind.get() == Some(DeclarationKind::Const) {
             // The caller is responsible for emitting ThrowIfTDZ before calling
-            // emit_set_variable(), matching the C++ pipeline behavior.
+            // emit_set_variable().
             generator.emit(Instruction::ThrowConstAssignment {});
             return;
         }
         let local_index = ident.local_index.get();
         let local = generator.resolve_local(local_index, ident.local_type.get().unwrap());
-        // Match C++ emit_set_variable: skip self-move entirely.
+        // Skip self-move entirely.
         let is_variable_self_move = ident.local_type.get() == Some(LocalType::Variable)
             && value.operand().is_local()
             && value.operand().index() == local_index;
@@ -4396,7 +4404,7 @@ fn emit_set_variable(generator: &mut Generator, ident: &Identifier, value: &Scop
             return;
         }
         // No TDZ check here: the caller is responsible for checking TDZ
-        // before calling emit_set_variable(), matching C++ pipeline behavior.
+        // before calling emit_set_variable().
         generator.emit(Instruction::Mov {
             dst: local.operand(),
             src: value.operand(),
@@ -4582,7 +4590,7 @@ fn emit_evaluate_member_reference(
         let is_super = matches!(object.inner, ExpressionKind::Super);
 
         if is_super {
-            // Match C++ order: ResolveThisBinding first, then ResolveSuperBase.
+            // ResolveThisBinding first, then ResolveSuperBase.
             let this_value = emit_resolve_this_binding(generator);
             let base = generator.allocate_register();
             generator.emit(Instruction::ResolveSuperBase {
@@ -4591,7 +4599,7 @@ fn emit_evaluate_member_reference(
             if *computed {
                 let property = generate_expression_or_undefined(property, generator, None);
                 // If the computed property is a constant string (e.g. super["minutes"]),
-                // optimize to SuperMemberId to match the C++ pipeline.
+                // optimize to SuperMemberId.
                 if let Some(key) = generator.try_constant_string_to_property_key(&property) {
                     let cache = generator.next_property_lookup_cache();
                     EvaluatedReference::SuperMemberId {
@@ -4626,7 +4634,7 @@ fn emit_evaluate_member_reference(
             if *computed {
                 let property = generate_expression_or_undefined(property, generator, None);
                 // If the computed property is a constant string (e.g. obj["key"]),
-                // optimize to MemberId to match the C++ pipeline.
+                // optimize to MemberId.
                 if let Some(key) = generator.try_constant_string_to_property_key(&property) {
                     let cache = generator.next_property_lookup_cache();
                     EvaluatedReference::MemberId {
@@ -4739,7 +4747,7 @@ fn emit_store_to_reference(generator: &mut Generator, target: &Expression, value
             computed,
         } => {
             if matches!(object.inner, ExpressionKind::Super) {
-                // Match C++ order: ResolveThisBinding first, then ResolveSuperBase.
+                // ResolveThisBinding first, then ResolveSuperBase.
                 let this_value = emit_resolve_this_binding(generator);
                 let base = generator.allocate_register();
                 generator.emit(Instruction::ResolveSuperBase {
@@ -4864,7 +4872,7 @@ fn emit_compound_assignment(
                 dst: dst_op,
                 lhs: lhs_op,
                 rhs: rhs_op,
-            })
+            });
         }
         AssignmentOp::AndAssignment
         | AssignmentOp::OrAssignment
@@ -4898,7 +4906,7 @@ fn generate_template_literal(
         return Some(generator.add_constant_string(Utf16String::new()));
     }
 
-    // Allocate dst before generating expressions to match C++ register order.
+    // Allocate dst before generating expressions.
     let dst = choose_dst(generator, preferred_dst);
 
     if segments.len() == 1 {
@@ -4946,7 +4954,7 @@ fn generate_tagged_template_literal(
     tag: &Expression,
     template_literal: &Expression,
     preferred_dst: Option<&ScopedOperand>,
-) -> Option<ScopedOperand> {
+) -> ScopedOperand {
     // Resolve tag and this_value based on the tag expression type.
     let (tag_reg, this_value) = match &tag.inner {
         ExpressionKind::Member {
@@ -5024,9 +5032,8 @@ fn generate_tagged_template_literal(
 
     // Build template strings for GetTemplateObject.
     // expressions has alternating: string_0, expression_0, string_1, expression_1, ..., string_n
-    let data = match &template_literal.inner {
-        ExpressionKind::TemplateLiteral(d) => d,
-        _ => unreachable!("TaggedTemplateLiteral template must be TemplateLiteral"),
+    let ExpressionKind::TemplateLiteral(data) = &template_literal.inner else {
+        unreachable!("TaggedTemplateLiteral template must be TemplateLiteral");
     };
 
     // Collect cooked strings (even indices). NullLiteral means invalid escape → undefined.
@@ -5076,11 +5083,7 @@ fn generate_tagged_template_literal(
         arguments,
     });
 
-    // FIXME: Remove these manual drop() calls when we no longer need to match C++ register allocation.
-    drop(argument_regs);
-    drop(this_op);
-
-    Some(dst)
+    dst
 }
 
 // =============================================================================
@@ -5103,7 +5106,7 @@ fn generate_switch_statement(
         generator.start_boundary(BlockBoundaryType::LeaveLexicalEnvironment);
     }
 
-    // Create first test block and jump to it (matching C++ structure).
+    // Create first test block and jump to it.
     let first_test_block = generator.make_block();
     generator.emit(Instruction::Jump {
         target: first_test_block,
@@ -5119,8 +5122,7 @@ fn generate_switch_statement(
 
     // Emit comparison chain: for each case, create the case body block,
     // switch to the test block, evaluate the test, and emit comparison.
-    // This matches C++ block creation order: test blocks interleaved with
-    // case body blocks.
+    // Test blocks are interleaved with case body blocks.
     let mut next_test_block = first_test_block;
     let mut case_blocks: Vec<Label> = Vec::with_capacity(data.cases.len());
     let mut default_block = None;
@@ -5132,7 +5134,7 @@ fn generate_switch_statement(
             generator.switch_to_basic_block(next_test_block);
             let test_val = generate_expression(test, generator, None)?;
             let cmp = generator.allocate_register();
-            // NB: test_value is LHS, discriminant is RHS (matching C++).
+            // NB: test_value is LHS, discriminant is RHS.
             generator.emit(Instruction::StrictlyEquals {
                 dst: cmp.operand(),
                 lhs: test_val.operand(),
@@ -5291,7 +5293,7 @@ fn generate_object_expression(
     generator: &mut Generator,
     properties: &[ObjectProperty],
     preferred_dst: Option<&ScopedOperand>,
-) -> Option<ScopedOperand> {
+) -> ScopedOperand {
     let dst = choose_dst(generator, preferred_dst);
 
     // Determine if this is a simple object literal (all KeyValue with non-computed
@@ -5299,7 +5301,7 @@ fn generate_object_expression(
     // benefit from shape caching. Numeric string keys like "0" are stored in
     // indexed storage rather than shape-based storage, so they can't use the fast path.
     //
-    // NB: The C++ parser treats {["x"]: 1} identically to {"x": 1} at the AST level
+    // NB: The parser treats {["x"]: 1} identically to {"x": 1} at the AST level
     // (both produce a StringLiteral key with is_computed=false). The parser keeps
     // is_computed=true for bracket-enclosed keys. We normalize here by treating
     // StringLiteral keys as non-computed regardless of is_computed.
@@ -5326,7 +5328,7 @@ fn generate_object_expression(
     });
 
     if properties.is_empty() {
-        return Some(dst);
+        return dst;
     }
 
     for (slot, property) in properties.iter().enumerate() {
@@ -5341,7 +5343,7 @@ fn generate_object_expression(
         }
 
         // For non-string keys (computed, numeric, etc.), evaluate key before value
-        // (spec evaluation order). C++ treats all non-StringLiteral keys the same:
+        // (spec evaluation order). All non-StringLiteral keys are treated the same:
         // generate key → ToPrimitiveWithStringHint → generate value → PutByValue.
         //
         // NB: StringLiteral keys are always treated as non-computed (see is_simple comment).
@@ -5506,7 +5508,7 @@ fn generate_object_expression(
         });
     }
 
-    Some(dst)
+    dst
 }
 
 /// Emit a property set for an object literal key (static or computed).
@@ -5663,7 +5665,7 @@ fn generate_optional_chain_inner(
         } => {
             let is_super = matches!(object.inner, ExpressionKind::Super);
             // For super property access, resolve this binding first (before
-            // ResolveSuperBase) to match C++ evaluation order.
+            // ResolveSuperBase) per spec evaluation order.
             let this_value = if is_super {
                 Some(emit_resolve_this_binding(generator))
             } else {
@@ -5717,7 +5719,7 @@ fn generate_optional_chain_inner(
     generator.emit_mov(current_value, &new_current_value);
 
     // Create shared blocks: load_undefined_block is reused for all optional
-    // short-circuits (matching C++ block layout).
+    // short-circuits.
     let load_undefined_block = generator.make_block();
     let end_block = generator.make_block();
 
@@ -5794,8 +5796,7 @@ fn generate_optional_chain_inner(
     Some(())
 }
 
-/// Convert arguments to an array for CallWithArgumentArray (matching C++
-/// arguments_to_array_for_call).
+/// Convert arguments to an array for CallWithArgumentArray.
 fn generate_arguments_array(
     generator: &mut Generator,
     arguments: &[CallArgument],
@@ -5829,8 +5830,8 @@ fn generate_arguments_array(
         element_count: u32_from_usize(arg_ops.len()),
         elements: arg_ops,
     });
-    // NB: arg_holders stays alive until function return, matching C++ where
-    // the args Vector keeps registers held through the spread arguments loop.
+    // NB: arg_holders stays alive until function return so their registers
+    // aren't reused during the spread arguments loop.
 
     for argument in &arguments[first_spread..] {
         let val = generate_expression_or_undefined(&argument.value, generator, None);
@@ -5858,7 +5859,7 @@ fn generate_class_expression(
     generator: &mut Generator,
     data: &ClassData,
     preferred_dst: Option<&ScopedOperand>,
-) -> Option<ScopedOperand> {
+) -> ScopedOperand {
     let has_super = data.super_class.is_some();
     // Always consume pending_lhs_name. Named classes don't use it, but we
     // must clear it to prevent it from leaking to nested expressions.
@@ -5883,7 +5884,7 @@ fn generate_class_expression(
 
     // Step 3.a: Create binding for the class name in the class environment.
     // Only emit when the class has a name, or when there's no lhs_name
-    // (matching C++ behavior which skips this for anonymous classes with lhs_name).
+    // (skip this for anonymous classes with lhs_name).
     if data.name.is_some() || lhs_name.is_none() {
         let name = if let Some(name_ident) = &data.name {
             name_ident.name.clone()
@@ -5932,7 +5933,7 @@ fn generate_class_expression(
 
     // First pass: evaluate all computed property keys.
     // This must happen before registering the constructor and method SFDs,
-    // matching the C++ pipeline's two-loop structure.
+    // using a two-pass structure.
     let mut element_keys: Vec<Option<ScopedOperand>> = Vec::with_capacity(data.elements.len());
     for element_node in &data.elements {
         match &element_node.inner {
@@ -6021,7 +6022,7 @@ fn generate_class_expression(
                     private_identifier_len: priv_len,
                     shared_function_data_index: sfd_index,
                     has_initializer: false,
-                    literal_value_kind: LiteralValueKind::None as u8,
+                    literal_value_kind: LiteralValueKind::None,
                     literal_value_number: 0.0,
                     literal_value_string: std::ptr::null(),
                     literal_value_string_len: 0,
@@ -6034,8 +6035,8 @@ fn generate_class_expression(
             } => {
                 // Detect literal initializers and store the value directly,
                 // avoiding function creation for simple cases like x = 0.
-                // This matches C++ ASTCodegen.cpp behavior.
-                let mut literal_value_kind = LiteralValueKind::None as u8;
+                // This avoids function creation for simple cases.
+                let mut literal_value_kind = LiteralValueKind::None;
                 let mut literal_value_number: f64 = 0.0;
                 let mut literal_value_string = Utf16String::new();
                 let mut sfd_index = super::ffi::FFIOptionalU32::none();
@@ -6043,30 +6044,30 @@ fn generate_class_expression(
                 if let Some(init_expression) = initializer {
                     let is_literal = match &init_expression.inner {
                         ExpressionKind::NumericLiteral(n) => {
-                            literal_value_kind = LiteralValueKind::Number as u8;
+                            literal_value_kind = LiteralValueKind::Number;
                             literal_value_number = *n;
                             true
                         }
                         ExpressionKind::BooleanLiteral(b) => {
                             literal_value_kind = if *b {
-                                LiteralValueKind::BooleanTrue as u8
+                                LiteralValueKind::BooleanTrue
                             } else {
-                                LiteralValueKind::BooleanFalse as u8
+                                LiteralValueKind::BooleanFalse
                             };
                             true
                         }
                         ExpressionKind::NullLiteral => {
-                            literal_value_kind = LiteralValueKind::Null as u8;
+                            literal_value_kind = LiteralValueKind::Null;
                             true
                         }
                         ExpressionKind::StringLiteral(s) => {
-                            literal_value_kind = LiteralValueKind::String as u8;
+                            literal_value_kind = LiteralValueKind::String;
                             literal_value_string = s.clone();
                             true
                         }
                         ExpressionKind::Unary { op, operand } if *op == UnaryOp::Minus => {
                             if let ExpressionKind::NumericLiteral(n) = &operand.inner {
-                                literal_value_kind = LiteralValueKind::Number as u8;
+                                literal_value_kind = LiteralValueKind::Number;
                                 literal_value_number = -n;
                                 true
                             } else {
@@ -6212,7 +6213,7 @@ fn generate_class_expression(
                     private_identifier_len: 0,
                     shared_function_data_index: sfd_index,
                     has_initializer: false,
-                    literal_value_kind: LiteralValueKind::None as u8,
+                    literal_value_kind: LiteralValueKind::None,
                     literal_value_number: 0.0,
                     literal_value_string: std::ptr::null(),
                     literal_value_string_len: 0,
@@ -6266,7 +6267,7 @@ fn generate_class_expression(
     });
     generator.lexical_environment_register_stack.pop();
 
-    // Allocate dst after element keys (matching C++ register ordering).
+    // Allocate dst after element keys.
     let dst = choose_dst(generator, preferred_dst);
 
     // Emit NewClass instruction
@@ -6284,7 +6285,7 @@ fn generate_class_expression(
         generator.emit(Instruction::LeavePrivateEnvironment);
     }
 
-    Some(dst)
+    dst
 }
 
 /// Synthesize a default constructor SharedFunctionInstanceData.
@@ -6539,8 +6540,8 @@ fn generate_for_in_statement(
         emit_set_variable(generator, ident, &value);
     }
 
-    // Match C++ block creation order: end_block and update_block first,
-    // then nullish_block and continuation_block during head evaluation.
+    // Create end_block and update_block first, then nullish_block and
+    // continuation_block during head evaluation.
     let end_block = generator.make_block();
     let update_block = generator.make_block();
     let needs_lexical_env = for_in_of_needs_lexical_env(lhs);
@@ -6548,40 +6549,44 @@ fn generate_for_in_statement(
     // B.3.5 Initializers in ForIn Statement Heads: evaluate initializer before RHS.
     // Create TDZ for lexical declarations before evaluating the RHS expression.
     let entered_tdz = enter_for_in_of_head_tdz(generator, lhs);
-    let object = generate_expression_or_undefined(rhs, generator, None);
-    if entered_tdz {
-        leave_for_in_of_head_tdz(generator);
-    }
 
-    // Allocate iterator registers (matching C++ order in for_in_of_head_evaluation).
-    let iterator_object = generator.allocate_register();
-    let iterator_next_method = generator.allocate_register();
-    let iterator_done = generator.allocate_register();
+    // Evaluate RHS into `object`, allocate iterator registers, emit the
+    // null/undefined check + GetObjectPropertyIterator, then let `object`
+    // go out of scope so its register is freed before the loop body.
+    let (iterator_object, iterator_next_method, iterator_done) = {
+        let object = generate_expression_or_undefined(rhs, generator, None);
+        if entered_tdz {
+            leave_for_in_of_head_tdz(generator);
+        }
 
-    // Check for null/undefined
-    let nullish_block = generator.make_block();
-    let continue_block = generator.make_block();
-    generator.emit(Instruction::JumpNullish {
-        condition: object.operand(),
-        true_target: nullish_block,
-        false_target: continue_block,
-    });
+        let iterator_object = generator.allocate_register();
+        let iterator_next_method = generator.allocate_register();
+        let iterator_done = generator.allocate_register();
 
-    generator.switch_to_basic_block(nullish_block);
-    generator.emit(Instruction::Jump { target: end_block });
+        // Check for null/undefined
+        let nullish_block = generator.make_block();
+        let continue_block = generator.make_block();
+        generator.emit(Instruction::JumpNullish {
+            condition: object.operand(),
+            true_target: nullish_block,
+            false_target: continue_block,
+        });
 
-    generator.switch_to_basic_block(continue_block);
+        generator.switch_to_basic_block(nullish_block);
+        generator.emit(Instruction::Jump { target: end_block });
 
-    // Get property iterator
-    generator.emit(Instruction::GetObjectPropertyIterator {
-        dst_iterator_object: iterator_object.operand(),
-        dst_iterator_next: iterator_next_method.operand(),
-        dst_iterator_done: iterator_done.operand(),
-        object: object.operand(),
-    });
-    // FIXME: Remove this manual drop() when we no longer need to match C++ register allocation.
-    drop(object);
+        generator.switch_to_basic_block(continue_block);
 
+        // Get property iterator
+        generator.emit(Instruction::GetObjectPropertyIterator {
+            dst_iterator_object: iterator_object.operand(),
+            dst_iterator_next: iterator_next_method.operand(),
+            dst_iterator_done: iterator_done.operand(),
+            object: object.operand(),
+        });
+
+        (iterator_object, iterator_next_method, iterator_done)
+    };
     // Body evaluation: completion, then jump to update block.
     let completion = generator.allocate_completion_register();
 
@@ -6622,7 +6627,7 @@ fn generate_for_in_statement(
     }
 
     if !generator.is_current_block_terminated() {
-        generate_with_completion(body, generator, &completion, preferred_dst);
+        generate_with_completion(body, generator, completion.as_ref(), preferred_dst);
     }
 
     if needs_lexical_env {
@@ -6720,40 +6725,43 @@ fn generate_for_of_statement_inner(
     preferred_dst: Option<&ScopedOperand>,
     is_await: bool,
 ) -> Option<ScopedOperand> {
-    // Match C++ block creation order: create end_block and update_block before
-    // evaluating the RHS expression. This ensures loop blocks get lower block
-    // numbers than any blocks created during RHS evaluation (e.g. conditional
-    // expressions), matching the C++ pipeline's block layout.
+    // Create end_block and update_block before evaluating the RHS expression.
+    // This ensures loop blocks get lower block numbers than any blocks created
+    // during RHS evaluation (e.g. conditional expressions).
     let end_block = generator.make_block();
     let update_block = generator.make_block();
 
     // Create TDZ for lexical declarations before evaluating the RHS expression.
     let entered_tdz = enter_for_in_of_head_tdz(generator, lhs);
-    let object = generate_expression_or_undefined(rhs, generator, None);
-    if entered_tdz {
-        leave_for_in_of_head_tdz(generator);
-    }
     let needs_lexical_env = for_in_of_needs_lexical_env(lhs);
     let old_handler = generator.current_unwind_handler;
 
-    // Get iterator
-    let iterator_object = generator.allocate_register();
-    let iterator_next_method = generator.allocate_register();
-    let iterator_done = generator.allocate_register();
-    generator.emit(Instruction::GetIterator {
-        dst_iterator_object: iterator_object.operand(),
-        dst_iterator_next: iterator_next_method.operand(),
-        dst_iterator_done: iterator_done.operand(),
-        iterable: object.operand(),
-        hint: if is_await {
-            IteratorHint::Async
-        } else {
-            IteratorHint::Sync
-        } as u32,
-    });
+    // Evaluate RHS into `object`, allocate iterator registers, and emit
+    // GetIterator. The block scopes `object` so its register is freed
+    // before the loop body.
+    let (iterator_object, iterator_next_method, iterator_done) = {
+        let object = generate_expression_or_undefined(rhs, generator, None);
+        if entered_tdz {
+            leave_for_in_of_head_tdz(generator);
+        }
 
-    // FIXME: Remove this manual drop() when we no longer need to match C++ register allocation.
-    drop(object);
+        let iterator_object = generator.allocate_register();
+        let iterator_next_method = generator.allocate_register();
+        let iterator_done = generator.allocate_register();
+        generator.emit(Instruction::GetIterator {
+            dst_iterator_object: iterator_object.operand(),
+            dst_iterator_next: iterator_next_method.operand(),
+            dst_iterator_done: iterator_done.operand(),
+            iterable: object.operand(),
+            hint: if is_await {
+                IteratorHint::Async
+            } else {
+                IteratorHint::Sync
+            } as u32,
+        });
+
+        (iterator_object, iterator_next_method, iterator_done)
+    };
 
     let completion = generator.allocate_completion_register();
 
@@ -6801,7 +6809,7 @@ fn generate_for_of_statement_inner(
             iterator_done: iterator_done.operand(),
         });
         // Await the next result. Pre-allocate completion registers and emit
-        // Mov(received_completion, accumulator) before Await to match C++.
+        // Mov(received_completion, accumulator) before Await.
         let received_completion = generator.allocate_register();
         let received_completion_type = generator.allocate_register();
         let received_completion_value = generator.allocate_register();
@@ -6869,7 +6877,7 @@ fn generate_for_of_statement_inner(
     }
 
     if !generator.is_current_block_terminated() {
-        generate_with_completion(body, generator, &completion, preferred_dst);
+        generate_with_completion(body, generator, completion.as_ref(), preferred_dst);
     }
 
     // Restore lexical env before continuing
@@ -6969,7 +6977,7 @@ fn generate_for_of_statement_inner(
         });
 
         // Pre-allocate completion registers in this scope so they're freed
-        // together with return_method and inner_result (matching C++ destructor order).
+        // together with return_method and inner_result.
         let rc = generator.allocate_register();
         let rct = generator.allocate_register();
         let rcv = generator.allocate_register();
@@ -7068,50 +7076,43 @@ fn generate_for_of_statement_inner(
         });
         generator.switch_to_basic_block(close_try_block);
 
-        let return_method = generator.allocate_register();
-        let return_key = generator.intern_property_key(utf16!("return"));
-        generator.emit(Instruction::GetMethod {
-            dst: return_method.operand(),
-            object: iterator_object.operand(),
-            property: return_key,
-        });
+        {
+            let return_method = generator.allocate_register();
+            let return_key = generator.intern_property_key(utf16!("return"));
+            generator.emit(Instruction::GetMethod {
+                dst: return_method.operand(),
+                object: iterator_object.operand(),
+                property: return_key,
+            });
 
-        let call_return_block = generator.make_block();
-        generator.emit(Instruction::JumpUndefined {
-            condition: return_method.operand(),
-            true_target: rethrow_block,
-            false_target: call_return_block,
-        });
-        generator.switch_to_basic_block(call_return_block);
+            let call_return_block = generator.make_block();
+            generator.emit(Instruction::JumpUndefined {
+                condition: return_method.operand(),
+                true_target: rethrow_block,
+                false_target: call_return_block,
+            });
+            generator.switch_to_basic_block(call_return_block);
 
-        let inner_result = generator.allocate_register();
-        generator.emit(Instruction::Call {
-            dst: inner_result.operand(),
-            callee: return_method.operand(),
-            this_value: iterator_object.operand(),
-            expression_string: None,
-            argument_count: 0,
-            arguments: vec![],
-        });
+            let inner_result = generator.allocate_register();
+            generator.emit(Instruction::Call {
+                dst: inner_result.operand(),
+                callee: return_method.operand(),
+                this_value: iterator_object.operand(),
+                expression_string: None,
+                argument_count: 0,
+                arguments: vec![],
+            });
 
-        // Pre-allocate completion registers in this scope so they're freed
-        // together with return_method and inner_result (matching C++ destructor order).
-        let rc = generator.allocate_register();
-        let rct = generator.allocate_register();
-        let rcv = generator.allocate_register();
-        generate_await_with_completions(generator, &inner_result, &rc, &rct, &rcv);
+            let rc = generator.allocate_register();
+            let rct = generator.allocate_register();
+            let rcv = generator.allocate_register();
+            generate_await_with_completions(generator, &inner_result, &rc, &rct, &rcv);
 
-        // Even if close succeeded, rethrow original (spec step 5).
-        generator.emit(Instruction::Jump {
-            target: rethrow_block,
-        });
-
-        // FIXME: Remove these manual drop() calls when we no longer need to match C++ register allocation.
-        drop(rcv);
-        drop(rct);
-        drop(rc);
-        drop(inner_result);
-        drop(return_method);
+            // Even if close succeeded, rethrow original (spec step 5).
+            generator.emit(Instruction::Jump {
+                target: rethrow_block,
+            });
+        }
 
         // Exception handler: discard close error, rethrow original.
         generator.current_unwind_handler = old_close_handler;
@@ -7144,8 +7145,7 @@ fn generate_for_of_statement_inner(
     }
 
     // Release the FinallyContext's ScopedOperands so their registers
-    // can be reused (matching C++ where the FinallyContext goes out
-    // of scope on the stack after for-of codegen).
+    // can be reused.
     let dummy = generator.add_constant_undefined();
     generator.finally_contexts[finally_ctx_index].completion_type = dummy.clone();
     generator.finally_contexts[finally_ctx_index].completion_value = dummy;
@@ -7159,11 +7159,10 @@ fn assign_to_for_in_of_lhs(generator: &mut Generator, lhs: &ForInOfLhs, value: &
     match lhs {
         ForInOfLhs::Declaration(statement) => {
             // UsingDeclaration: disposal semantics not yet implemented.
-            // Match C++ behavior: UsingDeclaration is not recognized as a
-            // VariableDeclaration in for_in_of_head_evaluation, so C++ treats
-            // it as Assignment lhs_kind. emit_store_to_reference then calls
-            // UsingDeclaration::generate_bytecode (producing NewTypeError +
-            // Throw) and follows with NewReferenceError + Throw (dead code).
+            // UsingDeclaration is not recognized as a VariableDeclaration
+            // in for_in_of_head_evaluation, so it is treated as Assignment
+            // lhs_kind. This produces NewTypeError + Throw for the using
+            // declaration, followed by NewReferenceError + Throw (dead code).
             if matches!(statement.inner, StatementKind::UsingDeclaration { .. }) {
                 generate_statement(statement, generator, None);
                 let exception = generator.allocate_register();
@@ -7353,8 +7352,7 @@ fn generate_array_binding_pattern(
 
             // Rest element: collect remaining into array.
             // NB: Allocate register unconditionally, then re-allocate in the
-            // else branch (matching C++ which allocates before the if/else,
-            // then re-allocates after emit_jump_if in the !first path).
+            // else branch.
             let mut value = generator.allocate_register();
             if index == 0 {
                 generator.emit(Instruction::IteratorToArray {
@@ -7754,8 +7752,8 @@ fn generate_try_statement(
             generator.current_completion_register = saved_completion;
         }
 
-        // Match C++ ordering: save catch completion BEFORE restoring
-        // the lexical environment from the catch scope.
+        // Save catch completion BEFORE restoring the lexical environment
+        // from the catch scope.
         if generator.must_propagate_completion
             && let Some(ref cc) = catch_completion
             && !generator.is_current_block_terminated()
@@ -7826,7 +7824,7 @@ fn generate_try_statement(
     // Try body gets its own completion register to prevent
     // break/continue inside try from leaking values.
     // NB: try_completion must be declared outside the inner scope so its
-    // register stays alive during finally body generation, matching C++.
+    // register stays alive during finally body generation.
     let mut try_completion: Option<ScopedOperand> = None;
     {
         let saved_completion = generator.current_completion_register.clone();
@@ -7993,10 +7991,6 @@ fn generate_try_statement(
             });
         }
 
-        // FIXME: Remove these manual drop() calls when we no longer need to match C++ register allocation.
-        drop(try_completion);
-        drop(ctx_ct);
-        drop(ctx_cv);
         generator.finally_contexts[ctx_index].lexical_environment_at_entry = None;
         let dummy = generator.add_constant_undefined();
         generator.finally_contexts[ctx_index].completion_value = dummy.clone();
@@ -8102,15 +8096,15 @@ pub fn emit_function_declaration_instantiation(
     }
 
     // Determine if arguments object is needed (from parsing insights).
-    let mut arguments_object_needed = function_data.parsing_insights.might_need_arguments_object;
-
-    if is_arrow
+    let mut arguments_object_needed = if is_arrow
         || parameter_names
             .iter()
             .any(|p| p.name == utf16!("arguments"))
     {
-        arguments_object_needed = false;
-    }
+        false
+    } else {
+        function_data.parsing_insights.might_need_arguments_object
+    };
 
     let function_scope_data = body_scope.function_scope_data.as_ref();
 
@@ -8237,7 +8231,7 @@ pub fn emit_function_declaration_instantiation(
                     match ident.local_type.get() {
                         Some(LocalType::Variable) => generator.mark_local_initialized(local_index),
                         Some(LocalType::Argument) => {
-                            generator.mark_argument_initialized(local_index)
+                            generator.mark_argument_initialized(local_index);
                         }
                         None => {}
                     }
@@ -8402,7 +8396,7 @@ pub fn emit_function_declaration_instantiation(
 
     // --- Step 7: Lexical environment for non-local declarations ---
     // Note: this counts only let/const/class declarations (not function declarations,
-    // which are var-hoisted in function bodies). Matches C++ has_non_local_lexical_declarations().
+    // which are var-hoisted in function bodies).
     let lex_bindings_count = count_non_local_lexical_bindings(body_scope);
 
     if !strict && lex_bindings_count > 0 {
@@ -8655,7 +8649,7 @@ const BUILTIN_SET_ITERATOR_PROTOTYPE_NEXT: u8 = 19;
 const BUILTIN_STRING_ITERATOR_PROTOTYPE_NEXT: u8 = 20;
 
 /// Detect known builtin methods from a callee expression (e.g. Math.abs).
-/// Returns the Builtin enum value as u8, matching C++ Builtins.h ordering.
+/// Returns the Builtin enum value as u8, matching Builtins.h ordering.
 fn get_builtin(callee: &Expression) -> Option<u8> {
     let ExpressionKind::Member {
         object,
@@ -8875,14 +8869,12 @@ fn try_constant_fold_to_boolean(
 fn try_constant_loosely_equals(lhs: &ConstantValue, rhs: &ConstantValue) -> Option<bool> {
     // Same type: use strict equality rules.
     match (lhs, rhs) {
-        (ConstantValue::Null, ConstantValue::Null)
-        | (ConstantValue::Null, ConstantValue::Undefined)
-        | (ConstantValue::Undefined, ConstantValue::Null)
-        | (ConstantValue::Undefined, ConstantValue::Undefined) => return Some(true),
-        (ConstantValue::Null, _)
-        | (ConstantValue::Undefined, _)
-        | (_, ConstantValue::Null)
-        | (_, ConstantValue::Undefined) => return Some(false),
+        (
+            ConstantValue::Null | ConstantValue::Undefined,
+            ConstantValue::Null | ConstantValue::Undefined,
+        ) => return Some(true),
+        (ConstantValue::Null | ConstantValue::Undefined, _)
+        | (_, ConstantValue::Null | ConstantValue::Undefined) => return Some(false),
         (ConstantValue::Number(a), ConstantValue::Number(b)) => return Some(a == b),
         (ConstantValue::String(a), ConstantValue::String(b)) => return Some(a == b),
         (ConstantValue::Boolean(a), ConstantValue::Boolean(b)) => return Some(a == b),
@@ -9076,7 +9068,7 @@ fn js_exponentiate(base: f64, exponent: f64) -> f64 {
     base.powf(exponent)
 }
 
-/// Parse a non-decimal integer string via BigInt to f64, matching C++
+/// Parse a non-decimal integer string via BigInt to f64, matching
 /// UnsignedBigInteger::from_base() + to_double(). This avoids u64 overflow
 /// for large literals like 0x10000000000000000.
 fn bigint_string_to_f64(s: &str, radix: u32) -> f64 {
@@ -9570,7 +9562,7 @@ fn format_double_for_display(n: f64) -> String {
         return "0".to_string();
     }
     // Get the scientific notation representation to extract the exponent.
-    let e_str = format!("{:e}", n);
+    let e_str = format!("{n:e}");
     if let Some(e_pos) = e_str.find('e') {
         let exp_str = &e_str[e_pos + 1..];
         let displayed_exponent = exp_str.parse::<i32>().unwrap_or(0);
@@ -9579,11 +9571,11 @@ fn format_double_for_display(n: f64) -> String {
         if !(-6..=20).contains(&displayed_exponent) {
             let mantissa_part = &e_str[..e_pos];
             if displayed_exponent < 0 {
-                return format!("{}e{}", mantissa_part, displayed_exponent);
+                return format!("{mantissa_part}e{displayed_exponent}");
             } else {
-                return format!("{}e+{}", mantissa_part, displayed_exponent);
+                return format!("{mantissa_part}e+{displayed_exponent}");
             }
         }
     }
-    format!("{}", n)
+    format!("{n}")
 }

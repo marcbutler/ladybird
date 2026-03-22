@@ -5,6 +5,7 @@
  */
 
 #include <LibHTTP/Cookie/ParsedCookie.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/HelperProcess.h>
@@ -687,13 +688,12 @@ void WebContentClient::did_request_minimize_window(u64 page_id)
     }
 }
 
-Messages::WebContentClient::DidRequestFullscreenWindowResponse WebContentClient::did_request_fullscreen_window(u64 page_id)
+void WebContentClient::did_request_fullscreen_window(u64 page_id)
 {
     if (auto view = view_for_page_id(page_id); view.has_value()) {
         if (view->on_fullscreen_window)
             view->on_fullscreen_window();
     }
-    return true;
 }
 
 void WebContentClient::did_request_exit_fullscreen(u64 page_id)
@@ -787,11 +787,14 @@ void WebContentClient::did_allocate_backing_stores(u64 page_id, i32 front_bitmap
 Messages::WebContentClient::RequestWorkerAgentResponse WebContentClient::request_worker_agent(u64 page_id, Web::Bindings::AgentType worker_type)
 {
     if (auto view = view_for_page_id(page_id); view.has_value()) {
+        auto request_server_handle = MUST(connect_new_request_server_client());
+        auto image_decoder_handle = MUST(connect_new_image_decoder_client());
         auto worker_client = MUST(WebView::launch_web_worker_process(worker_type));
-        return worker_client->clone_transport();
+        auto worker_handle = MUST(worker_client->transport().release_for_transfer());
+        return { move(worker_handle), move(request_server_handle), move(image_decoder_handle) };
     }
 
-    return IPC::File {};
+    return { IPC::TransportHandle {}, IPC::TransportHandle {}, IPC::TransportHandle {} };
 }
 
 Optional<ViewImplementation&> WebContentClient::view_for_page_id(u64 page_id, SourceLocation location)

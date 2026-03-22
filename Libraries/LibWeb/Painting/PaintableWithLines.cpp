@@ -77,8 +77,6 @@ void PaintableWithLines::paint_text_fragment_debug_highlight(DisplayListRecordin
 TraversalDecision PaintableWithLines::hit_test(CSSPixelPoint position, HitTestType type, Function<TraversalDecision(HitTestResult)> const& callback) const
 {
     auto const is_visible = computed_values().visibility() == CSS::Visibility::Visible;
-    auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
-    auto const& scroll_state = document().paintable()->scroll_state_snapshot();
 
     Optional<CSSPixelPoint> local_position;
     bool acquired_local_position = false;
@@ -86,14 +84,7 @@ TraversalDecision PaintableWithLines::hit_test(CSSPixelPoint position, HitTestTy
     auto ensure_local_position = [&]() {
         if (exchange(acquired_local_position, true))
             return;
-
-        if (auto state = accumulated_visual_context()) {
-            auto result = state->transform_point_for_hit_test(position.to_type<float>() * pixel_ratio, scroll_state);
-            if (result.has_value())
-                local_position = (*result / pixel_ratio).to_type<CSSPixels>();
-        } else {
-            local_position = position;
-        }
+        local_position = transform_point_to_local(position);
     };
 
     // TextCursor hit testing mode should be able to place cursor in contenteditable elements even if they are empty.
@@ -141,15 +132,7 @@ TraversalDecision PaintableWithLines::hit_test(CSSPixelPoint position, HitTestTy
 
     // Fragments are descendants of this element, so use the descendants' visual context to account for this element's
     // own scroll offset during fragment hit testing.
-    auto avc_for_descendants = accumulated_visual_context_for_descendants();
-    Optional<CSSPixelPoint> local_position_for_fragments;
-    if (avc_for_descendants) {
-        auto result = avc_for_descendants->transform_point_for_hit_test(position.to_type<float>() * pixel_ratio, scroll_state);
-        if (result.has_value())
-            local_position_for_fragments = (*result / pixel_ratio).to_type<CSSPixels>();
-    } else {
-        local_position_for_fragments = local_position;
-    }
+    Optional<CSSPixelPoint> local_position_for_fragments = transform_point_to_local_for_descendants(position);
     if (local_position_for_fragments.has_value()) {
         if (hit_test_fragments(position, local_position_for_fragments.value(), type, callback) == TraversalDecision::Break)
             return TraversalDecision::Break;
@@ -157,7 +140,7 @@ TraversalDecision PaintableWithLines::hit_test(CSSPixelPoint position, HitTestTy
 
     if (!stacking_context() && (!layout_node().is_anonymous() || is_positioned())
         && absolute_border_box_rect().contains(local_position.value())) {
-        if (callback(HitTestResult { const_cast<PaintableWithLines&>(*this) }) == TraversalDecision::Break)
+        if (callback(HitTestResult { .paintable = const_cast<PaintableWithLines&>(*this) }) == TraversalDecision::Break)
             return TraversalDecision::Break;
     }
 
@@ -173,7 +156,7 @@ TraversalDecision PaintableWithLines::hit_test_fragments(CSSPixelPoint position,
         if (fragment_absolute_rect.contains(local_position)) {
             if (fragment.paintable().hit_test(position, type, callback) == TraversalDecision::Break)
                 return TraversalDecision::Break;
-            HitTestResult hit_test_result { const_cast<Paintable&>(fragment.paintable()), fragment.index_in_node_for_point(local_position), 0, 0 };
+            HitTestResult hit_test_result { .paintable = const_cast<Paintable&>(fragment.paintable()), .index_in_node = fragment.index_in_node_for_point(local_position), .vertical_distance = 0, .horizontal_distance = 0 };
             if (callback(hit_test_result) == TraversalDecision::Break)
                 return TraversalDecision::Break;
         } else if (type == HitTestType::TextCursor) {

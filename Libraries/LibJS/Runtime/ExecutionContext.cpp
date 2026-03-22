@@ -15,8 +15,6 @@
 
 namespace JS {
 
-GC_DEFINE_ALLOCATOR(CachedSourceRange);
-
 class ExecutionContextAllocator {
 public:
     NonnullOwnPtr<ExecutionContext> allocate(u32 registers_and_locals_count, u32 constants_count, u32 arguments_count)
@@ -106,7 +104,7 @@ NonnullOwnPtr<ExecutionContext> ExecutionContext::copy() const
 {
     // NB: We pass the entire non-argument count as registers_and_locals_count with 0 constants.
     //     This means all slots get initialized to empty, but we immediately overwrite them below.
-    auto copy = create(registers_and_constants_and_locals_and_arguments_count - arguments.size(), 0, arguments.size());
+    auto copy = create(registers_and_constants_and_locals_and_arguments_count - argument_count, 0, argument_count);
     copy->function = function;
     copy->realm = realm;
     copy->script_or_module = script_or_module;
@@ -114,13 +112,16 @@ NonnullOwnPtr<ExecutionContext> ExecutionContext::copy() const
     copy->variable_environment = variable_environment;
     copy->private_environment = private_environment;
     copy->program_counter = program_counter;
+    copy->yield_continuation = yield_continuation;
+    copy->yield_is_await = yield_is_await;
+    copy->caller_is_construct = caller_is_construct;
     copy->this_value = this_value;
     copy->executable = executable;
     copy->passed_argument_count = passed_argument_count;
     copy->registers_and_constants_and_locals_and_arguments_count = registers_and_constants_and_locals_and_arguments_count;
     for (size_t i = 0; i < registers_and_constants_and_locals_and_arguments_count; ++i)
         copy->registers_and_constants_and_locals_and_arguments()[i] = registers_and_constants_and_locals_and_arguments()[i];
-    copy->arguments = { copy->registers_and_constants_and_locals_and_arguments() + (arguments.data() - registers_and_constants_and_locals_and_arguments()), arguments.size() };
+    copy->argument_count = argument_count;
     return copy;
 }
 
@@ -131,15 +132,9 @@ void ExecutionContext::visit_edges(Cell::Visitor& visitor)
     visitor.visit(variable_environment);
     visitor.visit(lexical_environment);
     visitor.visit(private_environment);
-    visitor.visit(cached_source_range);
-    visitor.visit(context_owner);
     visitor.visit(this_value);
     visitor.visit(executable);
-    visitor.visit(caller_executable);
     visitor.visit(registers_and_constants_and_locals_and_arguments_span());
-    visitor.visit(global_object);
-    visitor.visit(global_declarative_environment);
-    visitor.visit(arguments);
     script_or_module.visit(
         [](Empty) {},
         [&](auto& script_or_module) {

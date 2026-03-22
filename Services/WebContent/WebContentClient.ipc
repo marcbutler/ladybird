@@ -1,5 +1,6 @@
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Color.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibGfx/Cursor.h>
 #include <LibGfx/ShareableBitmap.h>
 #include <LibHTTP/Cookie/Cookie.h>
@@ -100,7 +101,7 @@ endpoint WebContentClient
     did_request_resize_window(u64 page_id, Gfx::IntSize size) =|
     did_request_maximize_window(u64 page_id) =|
     did_request_minimize_window(u64 page_id) =|
-    did_request_fullscreen_window(u64 page_id) => (bool success)
+    did_request_fullscreen_window(u64 page_id) =|
     did_request_exit_fullscreen(u64 page_id) =|
     did_request_file(u64 page_id, ByteString path, i32 request_id) =|
     did_request_color_picker(u64 page_id, Color current_color) =|
@@ -134,5 +135,5 @@ endpoint WebContentClient
 
     did_find_in_page(u64 page_id, size_t current_match_index, Optional<size_t> total_match_count) =|
 
-    request_worker_agent(u64 page_id, Web::Bindings::AgentType worker_type) => (IPC::File socket) // FIXME: Add required attributes to select a SharedWorker Agent
+    request_worker_agent(u64 page_id, Web::Bindings::AgentType worker_type) => (IPC::TransportHandle handle, IPC::TransportHandle request_server_handle, IPC::TransportHandle image_decoder_handle) // FIXME: Add required attributes to select a SharedWorker Agent
 }

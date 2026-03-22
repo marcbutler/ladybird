@@ -64,64 +64,66 @@ enum class InvalidateLayoutTreeReason {
 
 [[nodiscard]] StringView to_string(InvalidateLayoutTreeReason);
 
-#define ENUMERATE_UPDATE_LAYOUT_REASONS(X) \
-    X(AutoScrollSelection)                 \
-    X(ChildDocumentStyleUpdate)            \
-    X(Debugging)                           \
-    X(DocumentElementFromPoint)            \
-    X(DocumentElementsFromPoint)           \
-    X(DocumentFindMatchingText)            \
-    X(DocumentSetDesignMode)               \
-    X(DumpDisplayList)                     \
-    X(ElementCheckVisibility)              \
-    X(ElementClientHeight)                 \
-    X(ElementClientWidth)                  \
-    X(ElementGetClientRects)               \
-    X(ElementIsPotentiallyScrollable)      \
-    X(ElementScroll)                       \
-    X(ElementScrollHeight)                 \
-    X(ElementScrollIntoView)               \
-    X(ElementScrollLeft)                   \
-    X(ElementScrollTop)                    \
-    X(ElementScrollWidth)                  \
-    X(ElementSetScrollLeft)                \
-    X(ElementSetScrollTop)                 \
-    X(EventHandlerHandleDoubleClick)       \
-    X(EventHandlerHandleDragAndDrop)       \
-    X(EventHandlerHandleMouseDown)         \
-    X(EventHandlerHandleMouseMove)         \
-    X(EventHandlerHandleMouseUp)           \
-    X(EventHandlerHandleMouseWheel)        \
-    X(EventHandlerHandleTripleClick)       \
-    X(HTMLElementGetTheTextSteps)          \
-    X(HTMLElementOffsetHeight)             \
-    X(HTMLElementOffsetLeft)               \
-    X(HTMLElementOffsetParent)             \
-    X(HTMLElementOffsetTop)                \
-    X(HTMLElementOffsetWidth)              \
-    X(HTMLElementScrollParent)             \
-    X(HTMLEventLoopRenderingUpdate)        \
-    X(HTMLImageElementHeight)              \
-    X(HTMLImageElementWidth)               \
-    X(HTMLImageElementX)                   \
-    X(HTMLImageElementY)                   \
-    X(HTMLInputElementHeight)              \
-    X(HTMLInputElementWidth)               \
-    X(HTMLLabelElementActivationBehavior)  \
-    X(InspectDOMTree)                      \
-    X(InternalsHitTest)                    \
-    X(MediaQueryListMatches)               \
-    X(NavigableSelectedText)               \
-    X(NavigableViewportScroll)             \
-    X(NodeNameOrDescription)               \
-    X(RangeGetClientRects)                 \
-    X(ResolvedCSSStyleDeclarationProperty) \
-    X(SVGDecodedImageDataRender)           \
-    X(ScrollCursorIntoView)                \
-    X(ProcessScreenshot)                   \
-    X(SVGGraphicsElementGetBBox)           \
-    X(SourceSetNormalizeSourceDensities)   \
-    X(ViewTransitionCapture)               \
+#define ENUMERATE_UPDATE_LAYOUT_REASONS(X)   \
+    X(AutoScrollSelection)                   \
+    X(ChildDocumentStyleUpdate)              \
+    X(Debugging)                             \
+    X(DocumentElementFromPoint)              \
+    X(DocumentElementsFromPoint)             \
+    X(DocumentFindMatchingText)              \
+    X(DocumentSetDesignMode)                 \
+    X(DumpDisplayList)                       \
+    X(ElementCheckVisibility)                \
+    X(ElementClientHeight)                   \
+    X(ElementClientWidth)                    \
+    X(ElementGetClientRects)                 \
+    X(ElementIsPotentiallyScrollable)        \
+    X(ElementScroll)                         \
+    X(ElementScrollHeight)                   \
+    X(ElementScrollIntoView)                 \
+    X(ElementScrollLeft)                     \
+    X(ElementScrollTop)                      \
+    X(ElementScrollWidth)                    \
+    X(ElementSetScrollLeft)                  \
+    X(ElementSetScrollTop)                   \
+    X(EventHandlerDispatchChromeWidgetEvent) \
+    X(EventHandlerHandleDragAndDrop)         \
+    X(EventHandlerHandleMouseDown)           \
+    X(EventHandlerHandleMouseMove)           \
+    X(EventHandlerHandleMouseUp)             \
+    X(EventHandlerHandleMouseWheel)          \
+    X(EventHandlerRunActivationBehavior)     \
+    X(EventHandlerShowContextMenu)           \
+    X(HTMLElementGetTheTextSteps)            \
+    X(HTMLElementOffsetHeight)               \
+    X(HTMLElementOffsetLeft)                 \
+    X(HTMLElementOffsetParent)               \
+    X(HTMLElementOffsetTop)                  \
+    X(HTMLElementOffsetWidth)                \
+    X(HTMLElementScrollParent)               \
+    X(HTMLEventLoopRenderingUpdate)          \
+    X(HTMLImageElementHeight)                \
+    X(HTMLImageElementWidth)                 \
+    X(HTMLImageElementX)                     \
+    X(HTMLImageElementY)                     \
+    X(HTMLInputElementHeight)                \
+    X(HTMLInputElementWidth)                 \
+    X(HTMLLabelElementActivationBehavior)    \
+    X(HostedDocumentBeforePaint)             \
+    X(InspectDOMTree)                        \
+    X(InternalsHitTest)                      \
+    X(MediaQueryListMatches)                 \
+    X(NavigableSelectedText)                 \
+    X(NavigableViewportScroll)               \
+    X(NodeNameOrDescription)                 \
+    X(RangeGetClientRects)                   \
+    X(ResolvedCSSStyleDeclarationProperty)   \
+    X(SVGDecodedImageDataRender)             \
+    X(ScrollCursorIntoView)                  \
+    X(ProcessScreenshot)                     \
+    X(SVGGraphicsElementGetBBox)             \
+    X(SourceSetNormalizeSourceDensities)     \
+    X(ViewTransitionCapture)                 \
     X(WindowScroll)
 
 enum class UpdateLayoutReason {
@@ -682,8 +684,6 @@ public:
 
     [[nodiscard]] bool has_been_destroyed() const { return m_has_been_destroyed; }
 
-    [[nodiscard]] bool has_been_browsing_context_associated() const { return m_has_been_browsing_context_associated; }
-
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document
     void destroy();
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document-and-its-descendants
@@ -1006,6 +1006,9 @@ public:
     GC::Ref<WebIDL::Promise> exit_fullscreen();
 
     void unfullscreen_element(GC::Ref<Element> element);
+    void unfullscreen();
+    bool is_simple_fullscreen_document() const;
+    GC::Ref<GC::HeapVector<GC::Ref<Document>>> collect_documents_to_unfullscreen();
 
     auto& script_blocking_style_sheet_set() { return m_script_blocking_style_sheet_set; }
     auto const& script_blocking_style_sheet_set() const { return m_script_blocking_style_sheet_set; }
@@ -1028,6 +1031,9 @@ public:
     CSS::StyleScope& style_scope() { return m_style_scope; }
 
     void exit_pointer_lock();
+
+    Optional<CSS::SelectorList> const* cached_query_selector_result(String const& selector_text) const;
+    void cache_query_selector_result(String selector_text, Optional<CSS::SelectorList>);
 
 protected:
     virtual void initialize(JS::Realm&) override;
@@ -1055,9 +1061,6 @@ private:
     void run_unloading_cleanup_steps();
 
     void evaluate_media_rules();
-
-    bool is_simple_fullscreen_document() const;
-    GC::Ref<GC::HeapVector<GC::Ref<Document>>> collect_documents_to_unfullscreen();
 
     enum class AddLineFeed {
         Yes,
@@ -1095,8 +1098,6 @@ private:
 
     void ensure_cookie_version_index(URL::URL const& new_url, URL::URL const& old_url = {});
 
-    void unfullscreen();
-
     GC::Ref<Page> m_page;
     GC::Ptr<CSS::StyleComputer> m_style_computer;
     GC::Ptr<CSS::FontComputer> m_font_computer;
@@ -1126,8 +1127,6 @@ private:
 
     bool m_has_been_destroyed { false };
     bool m_has_fired_document_became_inactive { false };
-
-    bool m_has_been_browsing_context_associated { false };
 
     String m_source;
 
@@ -1458,6 +1457,10 @@ private:
 
     // https://drafts.csswg.org/css-values-5/#random-caching
     HashMap<CSS::RandomCachingKey, double> m_element_shared_css_random_base_value_cache;
+
+    // Cache of parsed selector lists for querySelectorAll/querySelector.
+    static constexpr size_t max_selector_query_cache_size = 256;
+    HashMap<String, Optional<CSS::SelectorList>> m_selector_query_cache;
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;

@@ -34,11 +34,13 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StylePropertyMap.h>
+#include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
+#include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
@@ -463,16 +465,16 @@ WebIDL::ExceptionOr<QualifiedName> validate_and_extract(JS::Realm& realm, Option
     auto local_name = qualified_name;
 
     // 4. If qualifiedName contains a U+003A (:):
-    auto split_result = qualified_name.bytes_as_string_view().split_view(':', SplitBehavior::KeepEmpty);
-    if (split_result.size() > 1) {
-        // 1. Let splitResult be the result of running strictly split given qualifiedName and U+003A (:).
-        // 2. Set prefix to splitResult[0].
-        prefix = MUST(FlyString::from_utf8(split_result[0]));
+    auto qualified_name_view = qualified_name.bytes_as_string_view();
+    auto colon_position = qualified_name_view.find(':');
+    if (colon_position.has_value()) {
+        // 1. Set prefix to the part of qualifiedName before the first U+003A (:).
+        prefix = MUST(FlyString::from_utf8(qualified_name_view.substring_view(0, *colon_position)));
 
-        // 3. Set localName to splitResult[1].
-        local_name = MUST(FlyString::from_utf8(split_result[1]));
+        // 2. Set localName to the part of qualifiedName after the first U+003A (:).
+        local_name = MUST(FlyString::from_utf8(qualified_name_view.substring_view(*colon_position + 1)));
 
-        // 4. If prefix is not a valid namespace prefix, then throw an "InvalidCharacterError" DOMException.
+        // 3. If prefix is not a valid namespace prefix, then throw an "InvalidCharacterError" DOMException.
         if (!is_valid_namespace_prefix(*prefix))
             return WebIDL::InvalidCharacterError::create(realm, "Prefix not a valid namespace prefix."_utf16);
     }
@@ -858,6 +860,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_style(bool& did_cha
     m_style_uses_var_css_function = false;
     m_style_uses_tree_counting_function = false;
     m_style_uses_if_css_function = false;
+    m_style_uses_inherit_css_function = false;
     m_affected_by_has_pseudo_class_in_subject_position = false;
     m_affected_by_has_pseudo_class_in_non_subject_position = false;
     m_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator = false;
@@ -1265,9 +1268,22 @@ bool Element::is_focused() const
     return document().focused_area() == this;
 }
 
-bool Element::is_active() const
+bool Element::is_the_active_element() const
 {
     return document().active_element() == this;
+}
+
+bool Element::is_being_activated() const
+{
+    return m_is_being_activated;
+}
+
+void Element::set_being_activated(bool active)
+{
+    if (m_is_being_activated == active)
+        return;
+    m_is_being_activated = active;
+    invalidate_style(StyleInvalidationReason::ElementSetActive);
 }
 
 bool Element::is_target() const
@@ -1435,15 +1451,7 @@ Vector<CSSPixelRect> Element::get_client_rects() const
     Vector<CSSPixelRect> rects;
     if (auto const* paintable_box = this->paintable_box()) {
         auto absolute_rect = paintable_box->absolute_border_box_rect();
-
-        if (auto const& accumulated_visual_context = paintable_box->accumulated_visual_context()) {
-            auto pixel_ratio = static_cast<float>(document().page().client().device_pixels_per_css_pixel());
-            auto const& scroll_state = document().paintable()->scroll_state_snapshot();
-            auto result = accumulated_visual_context->transform_rect_to_viewport(absolute_rect.to_type<float>() * pixel_ratio, scroll_state);
-            rects.append((result * (1.f / pixel_ratio)).to_type<CSSPixels>());
-        } else {
-            rects.append(absolute_rect);
-        }
+        rects.append(paintable_box->transform_rect_to_viewport(absolute_rect));
     } else if (paintable()) {
         dbgln("FIXME: Failed to get client rects for element ({})", debug_description());
     }
@@ -1592,7 +1600,7 @@ void Element::moved_from(GC::Ptr<Node> old_parent)
     Base::moved_from(old_parent);
 }
 
-void Element::children_changed(ChildrenChangedMetadata const* metadata)
+void Element::children_changed(ChildrenChangedMetadata const& metadata)
 {
     Node::children_changed(metadata);
     set_needs_style_update(true);
@@ -2457,81 +2465,7 @@ GC::Ref<WebIDL::Promise> Element::request_fullscreen(FullscreenRequester fullscr
     }
 
     // 7. Return promise, and run the remaining steps in parallel.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [&realm, error, pending_doc, requesting_element = GC::Ref { *this }, promise]() mutable {
-        HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
-        // NB: Fullscreen API is affected by site-isolation and will require additional work once site-isolation is implemented.
-
-        // 8. If error is false, then resize pendingDoc’s node navigable’s top-level traversable’s active document’s
-        //    viewport’s dimensions FIXME: optionally taking into account options["navigationUI"]:
-        if (error == RequestFullscreenError::False)
-            pending_doc->page().client().page_did_request_fullscreen_window();
-
-        // 9. If any of the following conditions are false, then set error to true:
-        //    * This’s node document is pendingDoc.
-        //    * The fullscreen element ready check for this returns true.
-        if (pending_doc != requesting_element->owner_document())
-            error = RequestFullscreenError::ElementNodeDocIsNotPendingDoc;
-        if (!requesting_element->is_element_ready_for_fullscreen())
-            error = RequestFullscreenError::ElementReadyCheckFailed;
-
-        // 10. If error is true:
-        if (error != RequestFullscreenError::False) {
-            // 1. Append (fullscreenerror, this) to pendingDoc’s list of pending fullscreen events.
-            pending_doc->append_pending_fullscreen_change(PendingFullscreenEvent::Type::Error, requesting_element);
-
-            // 2. Reject promise with a TypeError exception and terminate these steps.
-            WebIDL::reject_promise(realm, promise, JS::TypeError::create(realm, request_fullscreen_error_to_string(error)));
-
-            return;
-        }
-
-        // 11. Let fullscreenElements be an ordered set initially consisting of this.
-        auto fullscreen_elements = realm.heap().allocate<GC::HeapVector<GC::Ref<Element>>>();
-        fullscreen_elements->elements().append(requesting_element);
-
-        // 12. While true:
-        while (true) {
-            // 1. Let last be the last item of fullscreenElements.
-            auto last = fullscreen_elements->elements().last();
-
-            // 2. Let container be last’s node navigable’s container.
-            auto container = last->navigable()->container();
-
-            // 3. If container is null, then break.
-            if (!container)
-                break;
-
-            // 4. Append container to fullscreenElements.
-            fullscreen_elements->elements().append(*container);
-        }
-
-        // 13. For each element in fullscreenElements:
-        for (auto& element : fullscreen_elements->elements()) {
-            // 1. Let doc be element’s node document.
-            auto& doc = element->document();
-
-            // 2. If element is doc’s fullscreen element, continue.
-            if (doc.fullscreen_element() == element) {
-                // Note: No need to notify observers when nothing has changed.
-                continue;
-            }
-
-            // 3. If element is this and this is an iframe element, then set element’s iframe fullscreen flag.
-            if (element == requesting_element && requesting_element->is_html_iframe_element()) {
-                auto& iframe_element = static_cast<HTML::HTMLIFrameElement&>(*element);
-                iframe_element.set_iframe_fullscreen_flag(true);
-            }
-
-            // 4. Fullscreen element within doc.
-            doc.fullscreen_element_within_doc(element);
-
-            // 5. Append (fullscreenchange, element) to doc’s list of pending fullscreen events.
-            doc.append_pending_fullscreen_change(PendingFullscreenEvent::Type::Change, element);
-        }
-
-        // 14. Resolve promise with undefined
-        WebIDL::resolve_promise(realm, promise, JS::js_undefined());
-    }));
+    pending_doc->page().enqueue_fullscreen_enter(*this, *pending_doc, error, promise);
 
     return promise;
 }
@@ -2568,26 +2502,9 @@ void Element::exit_fullscreen_on_element_removal()
     });
 }
 
-Utf16String Element::request_fullscreen_error_to_string(RequestFullscreenError error)
-{
-    switch (error) {
-    case RequestFullscreenError::False:
-        break;
-    case RequestFullscreenError::ElementReadyCheckFailed:
-        return "Element ready check failed"_utf16;
-    case RequestFullscreenError::UnsupportedElement:
-        return "Not supported element"_utf16;
-    case RequestFullscreenError::NoTransientUserActivation:
-        return "No transient user activation available to consume"_utf16;
-    case RequestFullscreenError::ElementNodeDocIsNotPendingDoc:
-        return "Element's node document is not pending doc"_utf16;
-    }
-    VERIFY_NOT_REACHED();
-}
-
 // https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
 // 5. If any of conditions are false, set error to true
-Element::RequestFullscreenError Element::is_element_allowed_to_enter_fullscreen(FullscreenRequester fullscreen_requester) const
+RequestFullscreenError Element::is_element_allowed_to_enter_fullscreen(FullscreenRequester fullscreen_requester) const
 {
     // * This’s namespace is the HTML namespace or this is an SVG svg or MathML math element. [SVG] [MATHML]
     // FIXME: This likely wants to use is<MathML::MathMLMathElement> instead.
@@ -3500,10 +3417,13 @@ void Element::set_cascaded_properties(Optional<CSS::PseudoElement> pseudo_elemen
     if (pseudo_element.has_value()) {
         if (pseudo_element.value() >= CSS::PseudoElement::KnownPseudoElementCount)
             return;
-        ensure_pseudo_element(pseudo_element.value()).set_cascaded_properties(cascaded_properties);
-    } else {
-        m_cascaded_properties = cascaded_properties;
+        if (cascaded_properties)
+            ensure_pseudo_element(pseudo_element.value()).set_cascaded_properties(cascaded_properties);
+        else if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
+            existing_pseudo_element->set_cascaded_properties({});
+        return;
     }
+    m_cascaded_properties = cascaded_properties;
 }
 
 GC::Ptr<CSS::ComputedProperties> Element::computed_properties(Optional<CSS::PseudoElement> pseudo_element_type)
@@ -3531,7 +3451,10 @@ void Element::set_computed_properties(Optional<CSS::PseudoElement> pseudo_elemen
     if (pseudo_element_type.has_value()) {
         if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(*pseudo_element_type))
             return;
-        ensure_pseudo_element(*pseudo_element_type).set_computed_properties(style);
+        if (style)
+            ensure_pseudo_element(*pseudo_element_type).set_computed_properties(style);
+        else if (auto existing_pseudo_element = get_pseudo_element(*pseudo_element_type); existing_pseudo_element.has_value())
+            existing_pseudo_element->set_computed_properties({});
         return;
     }
     m_computed_properties = style;
@@ -3562,11 +3485,10 @@ PseudoElement& Element::ensure_pseudo_element(CSS::PseudoElement type) const
     VERIFY(CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(type));
 
     if (!m_pseudo_element_data->get(type).has_value()) {
-        if (is_pseudo_element_root(type)) {
+        if (is_pseudo_element_root(type))
             m_pseudo_element_data->set(type, heap().allocate<PseudoElementTreeNode>());
-        } else {
+        else
             m_pseudo_element_data->set(type, heap().allocate<PseudoElement>());
-        }
     }
 
     return *(m_pseudo_element_data->get(type).value());
@@ -3579,11 +3501,13 @@ void Element::set_custom_property_data(Optional<CSS::PseudoElement> pseudo_eleme
         return;
     }
 
-    if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value())) {
+    if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value()))
         return;
-    }
 
-    ensure_pseudo_element(pseudo_element.value()).set_custom_property_data(move(data));
+    if (data)
+        ensure_pseudo_element(pseudo_element.value()).set_custom_property_data(move(data));
+    else if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
+        existing_pseudo_element->set_custom_property_data({});
 }
 
 RefPtr<CSS::CustomPropertyData const> Element::custom_property_data(Optional<CSS::PseudoElement> pseudo_element) const
@@ -4283,6 +4207,22 @@ Element::Directionality Element::parent_directionality() const
     return Directionality::Ltr;
 }
 
+static void prefetch_inline_style_image_resources(CSS::CSSStyleProperties const& inline_style, Document& document)
+{
+    auto load_image_if_needed = [&](CSS::StyleValue const& value) {
+        if (value.is_abstract_image())
+            const_cast<CSS::AbstractImageStyleValue&>(value.as_abstract_image()).load_any_resources(document);
+    };
+    for (auto const& property : inline_style.properties()) {
+        if (property.value->is_value_list()) {
+            for (auto const& item : property.value->as_value_list().values())
+                load_image_if_needed(*item);
+        } else {
+            load_image_if_needed(*property.value);
+        }
+    }
+}
+
 // https://dom.spec.whatwg.org/#concept-element-attributes-change-ext
 void Element::attribute_changed(FlyString const& local_name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
 {
@@ -4363,6 +4303,7 @@ void Element::attribute_changed(FlyString const& local_name, Optional<String> co
         if (!m_inline_style)
             m_inline_style = CSS::CSSStyleProperties::create_element_inline_style({ *this }, {}, {});
         m_inline_style->set_declarations_from_text(value.value_or(""_string));
+        prefetch_inline_style_image_resources(*m_inline_style, document());
         set_needs_style_update(true);
     } else if (local_name == HTML::AttributeNames::dir) {
         // https://html.spec.whatwg.org/multipage/dom.html#attr-dir

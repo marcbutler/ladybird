@@ -3,15 +3,18 @@ set(SOURCES
     Connection.cpp
     Decoder.cpp
     Encoder.cpp
+    TransportHandle.cpp
 )
 
 if (UNIX)
     list(APPEND SOURCES
+        Attachment.cpp
         File.cpp
         Message.cpp
         TransportSocket.cpp)
 else()
     list(APPEND SOURCES
+        Attachment.cpp
         FileWindows.cpp
         MessageWindows.cpp
         TransportSocketWindows.cpp)
